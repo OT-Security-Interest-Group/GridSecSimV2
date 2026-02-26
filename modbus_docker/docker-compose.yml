@@ -65,7 +65,7 @@ networks:
       parent: ens18
     ipam:
       config:
-        - subnet: "10.30.0.8/29"     # physical network subnet
+        - subnet: "10.30.0.0/24"     # physical network subnet
           gateway: "10.30.0.254"       # pfSense IP address
           # Exclude IPs already used by DHCP on your pfSense to avoid conflicts
           ip_range: "10.30.0.8/29"
