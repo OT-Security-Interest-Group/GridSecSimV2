@@ -20,8 +20,6 @@ services:
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.9
-    ports:
-      - "502:502" # Expose standard Modbus port
     command: ["python", "/app/scripts/server_tx_rtu.py"]
 
   # ---------------------------------------------------------
@@ -33,8 +31,6 @@ services:
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.10
-    ports:
-      - "502:502"
     command: ["python", "/app/scripts/server_dist_ied.py"]
 
   # ---------------------------------------------------------
@@ -46,8 +42,6 @@ services:
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.11
-    ports:
-      - "502:502"
     command: ["python", "/app/scripts/server_transformer.py"]
 
 # ---------------------------------------------------------
