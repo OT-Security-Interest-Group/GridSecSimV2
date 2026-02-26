@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install pymodbus for our ICS simulation
-RUN pip install --no-cache-dir pymodbus
+RUN pip install --no-cache-dir pymodbus==3.6.4
 
 # Set the working directory
 WORKDIR /app
