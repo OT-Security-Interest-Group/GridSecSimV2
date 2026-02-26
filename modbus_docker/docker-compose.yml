@@ -10,7 +10,7 @@ services:
     container_name: scada_master
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.5  # Assign a static IP on your physical subnet
+        ipv4_address: 10.30.0.8  # Assign a static IP on your physical subnet
 
   # ---------------------------------------------------------
   # Transmission RTU (High-Voltage Substation Server)
@@ -23,7 +23,7 @@ services:
     container_name: tx_rtu
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.128
+        ipv4_address: 10.30.0.9
 
   # ---------------------------------------------------------
   # Distribution IED (Breaker Relay Server)
@@ -36,7 +36,7 @@ services:
     container_name: dist_ied
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.129
+        ipv4_address: 10.30.0.10
 
   # ---------------------------------------------------------
   # Transformer Monitor (Analog Sensor Server)
@@ -49,7 +49,7 @@ services:
     container_name: transformer_sensor
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.130
+        ipv4_address: 10.30.0.11
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
@@ -59,10 +59,8 @@ networks:
     driver: macvlan
     driver_opts:
       # VM's primary interface facing pfSense
-      parent: ens18.20
+      parent: ens18
     ipam:
       config:
-        - subnet: "10.30.0.0/24"
-          gateway: "10.30.0.254"
         - subnet: "10.30.0.0/24"     # physical network subnet
           gateway: "10.30.0.254"       # pfSense IP address
