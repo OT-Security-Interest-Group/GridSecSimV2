@@ -6,7 +6,7 @@ services:
     build: .
     container_name: scada_master
     networks:
-      scada_macvlan:
+      grid_macvlan:
         ipv4_address: 10.30.0.5  # Assign a static IP on your physical subnet
     # Command to run your master script. 
     command: ["python", "/app/scripts/master_poller.py"]
@@ -48,16 +48,6 @@ services:
 # Network Configuration (CRITICAL STEP)
 # ---------------------------------------------------------
 networks:
-  scada_macvlan:
-    driver: macvlan
-    driver_opts:
-      # VM's primary interface facing pfSense
-      parent: ens18.10
-    ipam:
-      config:
-        - subnet: "10.30.0.0/25"     # physical network subnet
-          gateway: "10.30.0.254"       # pfSense IP address
-
   grid_macvlan:
     driver: macvlan
     driver_opts:
@@ -65,5 +55,7 @@ networks:
       parent: ens18.20
     ipam:
       config:
+        - subnet: "10.30.0.0/25"
+          gateway: "10.30.0.254"
         - subnet: "10.30.0.128/25"     # physical network subnet
           gateway: "10.30.0.254"       # pfSense IP address
