@@ -13,9 +13,8 @@ RUN pip install --no-cache-dir pymodbus==3.6.4
 # Set the working directory
 WORKDIR /app
 
-# Copy your Python simulation scripts into the container
-COPY ./scripts /app/scripts
+ARG SCRIPT_NAME
+ENV SCRIPT_NAME=${SCRIPT_NAME}
 
-# Keep the container running infinitely so you can execute scripts manually 
-# or override this CMD in docker-compose.yml
-CMD ["tail", "-f", "/dev/null"]
+COPY ./scripts/${SCRIPT_NAME} /app/scripts/${SCRIPT_NAME}
+CMD python /app/scripts/${SCRIPT_NAME}

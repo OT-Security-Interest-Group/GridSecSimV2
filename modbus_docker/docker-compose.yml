@@ -3,46 +3,53 @@ services:
   # SCADA Master (The Client polling the network)
   # ---------------------------------------------------------
   scada_master:
-    build: .
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: master_poller.py
     container_name: scada_master
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.5  # Assign a static IP on your physical subnet
-    # Command to run your master script. 
-    command: ["python", "/app/scripts/master_poller.py"]
 
   # ---------------------------------------------------------
   # Transmission RTU (High-Voltage Substation Server)
   # ---------------------------------------------------------
   tx_rtu:
-    build: .
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: server_tx_rtu.py
     container_name: tx_rtu
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.128
-    command: ["python", "/app/scripts/server_tx_rtu.py"]
 
   # ---------------------------------------------------------
   # Distribution IED (Breaker Relay Server)
   # ---------------------------------------------------------
   dist_ied:
-    build: .
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: server_dist_ied.py
     container_name: dist_ied
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.129
-    command: ["python", "/app/scripts/server_dist_ied.py"]
 
   # ---------------------------------------------------------
   # Transformer Monitor (Analog Sensor Server)
   # ---------------------------------------------------------
   transformer_sensor:
-    build: .
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: server_transformer.py
     container_name: transformer_sensor
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.130
-    command: ["python", "/app/scripts/server_transformer.py"]
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
