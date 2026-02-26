@@ -52,17 +52,17 @@ networks:
     driver: macvlan
     driver_opts:
       # VM's primary interface facing pfSense
-      parent: ens18
+      parent: ens18.10
     ipam:
       config:
-        - subnet: "10.30.0.7/32"     # physical network subnet
+        - subnet: "10.30.0.0/24"     # physical network subnet
           gateway: "10.30.0.254"       # pfSense IP address
 
   grid_macvlan:
     driver: macvlan
     driver_opts:
       # VM's primary interface facing pfSense
-      parent: ens18
+      parent: ens18.20
     ipam:
       config:
         - subnet: "10.30.0.0/24"     # physical network subnet
