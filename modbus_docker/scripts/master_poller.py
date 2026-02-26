@@ -25,7 +25,7 @@ def run_master():
         if client.connect():
             try:
                 # Read 3 Holding Registers (Function Code 3) starting at Address 0
-                result = client.read_holding_registers(address=0, count=3, slave=1)
+                result = client.read_holding_registers(address=1, count=3, slave=1)
                 
                 if not result.isError():
                     vals = result.registers
