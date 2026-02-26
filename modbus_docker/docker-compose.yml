@@ -64,4 +64,4 @@ networks:
       config:
         - subnet: "10.30.0.0/24"     # physical network subnet
           gateway: "10.30.0.254"       # pfSense IP address
-          ip-range: "10.30.0.8/29"
+          ip_range: "10.30.0.8/29"
