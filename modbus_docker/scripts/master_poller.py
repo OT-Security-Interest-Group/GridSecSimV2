@@ -6,7 +6,7 @@ from datetime import datetime
 from pymodbus.client import ModbusTcpClient
 
 # Target the static IP assigned to the tx_rtu in the docker-compose.yml
-TARGET_IP = '192.168.50.20' 
+TARGET_IP = '10.30.0.9' 
 PORT = 502
 LOG_FILE = '/app/scripts/scada_poll_log.csv'
 
