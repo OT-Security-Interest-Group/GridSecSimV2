@@ -6,8 +6,8 @@ services:
     build:
       context: .
       args:
-        SCRIPT_NAME: scada_master.py
-    command: ['/app/scripts/scada_master.py', '--target', '10.30.0.3:5020']
+        SCRIPT_NAME: async_scada.py
+    command: ['/app/scripts/async_scada.py', '--target', '10.30.0.3:5020', '--count', '2']
     container_name: scada1
     networks:
       grid_macvlan:
@@ -17,8 +17,8 @@ services:
     build:
       context: .
       args:
-        SCRIPT_NAME: scada_master.py
-    command: ['/app/scripts/scada_master.py', '--target', ' 10.30.0.3:5020']
+        SCRIPT_NAME: async_scada.py
+    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.3:5020', '--count', '2']
     container_name: scada2
     networks: 
       grid_macvlan:
@@ -28,12 +28,23 @@ services:
     build:
       context: .
       args:
-        SCRIPT_NAME: scada_master.py
-    command: ['/app/scripts/scada_master.py', '--target', ' 10.30.0.3:5020']
+        SCRIPT_NAME: async_scada.py
+    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.2:5020', '--count', '2']
     container_name: scada3
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.32
+
+  scada4:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: async_scada.py
+    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.2:5020', '--count', '2']
+    container_name: scada4
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.28
 
   # ---------------------------------------------------------
   # Historian Loggers
@@ -65,12 +76,22 @@ services:
       context: .
       args:
         SCRIPT_NAME: historian_logger.py
-    command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.3:5020']
+    command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.2:5020']
     container_name: historian_logger3
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.49
 
+  historian_logger4:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: historian_logger.py
+    command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.2:5020']
+    container_name: historian_logger4
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.22
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
