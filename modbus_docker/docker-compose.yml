@@ -93,6 +93,31 @@ services:
       grid_macvlan:
         ipv4_address: 10.30.0.22
 
+  # ---------------------------------------------------------
+  # Attacker Containers
+  # ---------------------------------------------------------
+  DOS_Attack:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: DOS_Attack_Sim.py
+    command: ['/app/scripts/DOS_Attack_Sim.py']
+    container_name: DOS1
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.43
+
+  read_bulk:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: read_bulk.py
+    command: ['/app/scripts/read_bulk.py', '10.30.0.3']
+    container_name: read_bulk1
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.11
+
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
 # ---------------------------------------------------------
