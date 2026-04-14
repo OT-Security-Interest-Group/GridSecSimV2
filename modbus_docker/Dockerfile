@@ -1,17 +1,10 @@
 FROM python:3.10-slim
 
-# Install system utilities (tcpdump for local PCAP, iproute2/iputils-ping for network troubleshooting)
-RUN apt-get update && apt-get install -y \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install pymodbus for our ICS simulation
 RUN pip install --no-cache-dir pymodbus==3.6.4
 
-# Set the working directory
 WORKDIR /app
 
-ARG SCRIPT_NAME
-ENV SCRIPT_NAME=${SCRIPT_NAME}
+# Single image with all simulation scripts (SCADA, historians, attacks, orchestrator)
+COPY ./scripts/ /app/scripts/
 
-COPY ./scripts/${SCRIPT_NAME} /app/scripts/${SCRIPT_NAME}
 ENTRYPOINT ["python"]

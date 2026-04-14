@@ -5,30 +5,24 @@ services:
   scada_master:
     build:
       context: .
-      args:
-        SCRIPT_NAME: async_scada.py
     command: ['/app/scripts/async_scada.py', '--target', '10.30.0.3:5020', '--count', '2']
     container_name: scada1
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.8  # Assign a static IP on your physical subnet
+        ipv4_address: 10.30.0.8
 
   scada2:
     build:
       context: .
-      args:
-        SCRIPT_NAME: async_scada.py
     command: ['/app/scripts/async_scada.py', '--target', '10.30.0.3:5020', '--count', '2']
     container_name: scada2
-    networks: 
+    networks:
       grid_macvlan:
         ipv4_address: 10.30.0.17
 
   scada3:
     build:
       context: .
-      args:
-        SCRIPT_NAME: async_scada.py
     command: ['/app/scripts/async_scada.py', '--target', '10.30.0.5:5020', '--count', '2']
     container_name: scada3
     networks:
@@ -38,8 +32,6 @@ services:
   scada4:
     build:
       context: .
-      args:
-        SCRIPT_NAME: async_scada.py
     command: ['/app/scripts/async_scada.py', '--target', '10.30.0.5:5020', '--count', '2']
     container_name: scada4
     networks:
@@ -52,8 +44,6 @@ services:
   historian_logger:
     build:
       context: .
-      args:
-        SCRIPT_NAME: historian_logger.py
     command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.3:5020']
     container_name: historian_logger1
     networks:
@@ -63,8 +53,6 @@ services:
   historian_logger2:
     build:
       context: .
-      args:
-        SCRIPT_NAME: historian_logger.py
     command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.3:5020']
     container_name: historian_logger2
     networks:
@@ -74,8 +62,6 @@ services:
   historian_logger3:
     build:
       context: .
-      args:
-        SCRIPT_NAME: historian_logger.py
     command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.5:5020']
     container_name: historian_logger3
     networks:
@@ -85,8 +71,6 @@ services:
   historian_logger4:
     build:
       context: .
-      args:
-        SCRIPT_NAME: historian_logger.py
     command: ['/app/scripts/historian_logger.py', '--target', '10.30.0.5:5020']
     container_name: historian_logger4
     networks:
@@ -94,62 +78,81 @@ services:
         ipv4_address: 10.30.0.22
 
   # ---------------------------------------------------------
-  # Attacker Containers
+  # IDS dataset: multiple orchestrators = distinct source IPs in PCAP.
+  # Same attack mix per instance; different seeds + gaps reduce lockstep sync.
+  # Merge ids_events_orch*.jsonl for labels; each line includes source_ip.
   # ---------------------------------------------------------
-  dos_attack:
+  ids_orchestrator:
     build:
       context: .
-      args:
-        SCRIPT_NAME: DOS_Attack_Sim.py
-    command: ['/app/scripts/DOS_Attack_Sim.py']
-    container_name: dos1
-    networks:
-      grid_macvlan:
-        ipv4_address: 10.30.0.43
-
-  read_bulk:
-    build:
-      context: .
-      args:
-        SCRIPT_NAME: read_bulk.py
-    command: ['/app/scripts/read_bulk.py', '10.30.0.3', '0', '1000', '5020']
-    container_name: read_bulk1
+    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '101']
+    container_name: ids_dataset_orch1
+    hostname: ids-orch-1
+    volumes:
+      - ./dataset_out:/data
+    environment:
+      IDS_EVENTS_OUT: /data/ids_events_orch1.jsonl
+      IDS_SOURCE_IP: 10.30.0.11
+      IDS_ATTACKER_ID: orch1
+      IDS_ORCH_PLC1: 10.30.0.3:5020
+      IDS_ORCH_PLC2: 10.30.0.5:5020
+      IDS_MODBUS_UNIT: "0"
+      IDS_MIN_GAP_SEC: "25"
+      IDS_MAX_GAP_SEC: "180"
+      IDS_ATTACK_PROB: "0.72"
+      IDS_BENIGN_EXTRA_MAX: "240"
+    restart: unless-stopped
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.11
 
-  read_fc:
+  ids_orchestrator_2:
     build:
       context: .
-      args:
-        SCRIPT_NAME: read_fc_probe.py
-    command: ['/app/scripts/read_fc_probe.py', '10.30.0.5', '5020']
-    container_name: read_fc1
+    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '227']
+    container_name: ids_dataset_orch2
+    hostname: ids-orch-2
+    volumes:
+      - ./dataset_out:/data
+    environment:
+      IDS_EVENTS_OUT: /data/ids_events_orch2.jsonl
+      IDS_SOURCE_IP: 10.30.0.12
+      IDS_ATTACKER_ID: orch2
+      IDS_ORCH_PLC1: 10.30.0.3:5020
+      IDS_ORCH_PLC2: 10.30.0.5:5020
+      IDS_MODBUS_UNIT: "0"
+      IDS_MIN_GAP_SEC: "30"
+      IDS_MAX_GAP_SEC: "190"
+      IDS_ATTACK_PROB: "0.72"
+      IDS_BENIGN_EXTRA_MAX: "240"
+    restart: unless-stopped
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.30
+        ipv4_address: 10.30.0.12
 
-  write_bulk:
+  ids_orchestrator_3:
     build:
       context: .
-      args:
-        SCRIPT_NAME: write_bulk.py
-    command: ['/app/scripts/write_bulk.py', '10.30.0.5', '0', '100', '65535', '5020']
-    container_name: write_bulk1
+    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '331']
+    container_name: ids_dataset_orch3
+    hostname: ids-orch-3
+    volumes:
+      - ./dataset_out:/data
+    environment:
+      IDS_EVENTS_OUT: /data/ids_events_orch3.jsonl
+      IDS_SOURCE_IP: 10.30.0.13
+      IDS_ATTACKER_ID: orch3
+      IDS_ORCH_PLC1: 10.30.0.3:5020
+      IDS_ORCH_PLC2: 10.30.0.5:5020
+      IDS_MODBUS_UNIT: "0"
+      IDS_MIN_GAP_SEC: "35"
+      IDS_MAX_GAP_SEC: "200"
+      IDS_ATTACK_PROB: "0.72"
+      IDS_BENIGN_EXTRA_MAX: "240"
+    restart: unless-stopped
     networks:
       grid_macvlan:
-        ipv4_address: 10.30.0.25
-
-  write_dangerous:
-    build:
-      context: .
-      args:
-        SCRIPT_NAME: write_dangerous.py
-    command: ['/app/scripts/write_dangerous.py', '10.30.0.3', '50:9999', '--port', '5020']
-    container_name: write_dangerous1
-    networks:
-      grid_macvlan:
-        ipv4_address: 10.30.0.7
+        ipv4_address: 10.30.0.13
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
@@ -158,10 +161,9 @@ networks:
   grid_macvlan:
     driver: macvlan
     driver_opts:
-      # VM's primary interface facing pfSense
       parent: ens18
     ipam:
       config:
-        - subnet: "10.30.0.0/24"     # physical network subnet
-          gateway: "10.30.0.254"       # pfSense IP address
+        - subnet: "10.30.0.0/24"
+          gateway: "10.30.0.254"
           ip_range: "10.30.0.192/30"
