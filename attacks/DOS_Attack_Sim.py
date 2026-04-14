@@ -3,7 +3,7 @@ import statistics
 import random
 from pymodbus.client import ModbusTcpClient
 
-TARGET_IP = "10.30.0.3"   # Change to honeypot IP if needed
+TARGET_IP = "10.30.0.5"   # Change to honeypot IP if needed
 PORT = 5020
 REQUEST_RATE = 500       # Requests per second
 DURATION = 20            # Seconds to run
