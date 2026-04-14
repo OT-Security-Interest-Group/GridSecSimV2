@@ -18,7 +18,7 @@ services:
       context: .
       args:
         SCRIPT_NAME: async_scada.py
-    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.3:5020', '--count', '2']
+    command: ['/app/scripts/async_scada.py', '--target', '10.30.0.3:5020', '--count', '2']
     container_name: scada2
     networks: 
       grid_macvlan:
@@ -29,7 +29,7 @@ services:
       context: .
       args:
         SCRIPT_NAME: async_scada.py
-    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.5:5020', '--count', '2']
+    command: ['/app/scripts/async_scada.py', '--target', '10.30.0.5:5020', '--count', '2']
     container_name: scada3
     networks:
       grid_macvlan:
@@ -40,7 +40,7 @@ services:
       context: .
       args:
         SCRIPT_NAME: async_scada.py
-    command: ['/app/scripts/async_scada.py', '--target', ' 10.30.0.5:5020', '--count', '2']
+    command: ['/app/scripts/async_scada.py', '--target', '10.30.0.5:5020', '--count', '2']
     container_name: scada4
     networks:
       grid_macvlan:
