@@ -96,13 +96,13 @@ services:
   # ---------------------------------------------------------
   # Attacker Containers
   # ---------------------------------------------------------
-  DOS_Attack:
+  dos_attack:
     build:
       context: .
       args:
         SCRIPT_NAME: DOS_Attack_Sim.py
     command: ['/app/scripts/DOS_Attack_Sim.py']
-    container_name: DOS1
+    container_name: dos1
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.43
