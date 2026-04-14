@@ -112,11 +112,44 @@ services:
       context: .
       args:
         SCRIPT_NAME: read_bulk.py
-    command: ['/app/scripts/read_bulk.py', '10.30.0.3']
+    command: ['/app/scripts/read_bulk.py', '10.30.0.3', '0', '1000', '5020']
     container_name: read_bulk1
     networks:
       grid_macvlan:
         ipv4_address: 10.30.0.11
+
+  read_fc:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: read_fc_probe.py
+    command: ['/app/scripts/read_fc_probe.py', '10.30.0.5', '5020']
+    container_name: read_fc1
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.30
+
+  write_bulk:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: write_bulk.py
+    command: ['/app/scripts/write_bulk.py', '10.30.0.5', '0', '100', '65535', '5020']
+    container_name: write_bulk1
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.25
+
+  write_dangerous:
+    build:
+      context: .
+      args:
+        SCRIPT_NAME: write_dangerous.py
+    command: ['/app/scripts/write_dangerous.py', '10.30.0.3', '50:9999', '--port', '5020']
+    container_name: write_dangerous1
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.7
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
