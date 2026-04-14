@@ -35,9 +35,10 @@ async def run_scada(host, port, unit_id=0, poll_rate=0.5, client_id=1):
             await client.read_input_registers(address=0, count=7, slave=unit_id)
             
         except Exception as e:
-            log.debug(f"Read error: {e}")
-            client.close() # CRITICAL: Clean up the broken socket so the server drops it cleanly
-            
+            # Use WARNING so `docker logs` shows Modbus/network failures (DEBUG is hidden by default).
+            log.warning("Read error: %s — closing socket; will reconnect next cycle", e)
+            client.close()  # Drop broken socket so the next loop opens a fresh TCP session
+
         # Jitter prevents network spikes by staggering the requests slightly
         await asyncio.sleep(poll_rate + random.uniform(0.0, 0.15))
 
