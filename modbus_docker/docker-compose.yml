@@ -186,81 +186,80 @@ services:
         ipv4_address: 10.30.0.105
 
   # ---------------------------------------------------------
-  # IDS dataset: multiple orchestrators = distinct source IPs in PCAP.
-  # Same attack mix per instance; different seeds + gaps reduce lockstep sync.
-  # Merge ids_events_orch*.jsonl for labels; each line includes source_ip.
+  # IDS dataset orchestrators (attack traffic + JSONL labels) — commented out
+  # for benign-only captures. Uncomment the three services below to restore.
   # ---------------------------------------------------------
-  ids_orchestrator:
-    build:
-      context: .
-    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '101']
-    container_name: ids_dataset_orch1
-    hostname: ids-orch-1
-    volumes:
-      - ./dataset_out:/data
-    environment:
-      IDS_EVENTS_OUT: /data/ids_events_orch1.jsonl
-      IDS_SOURCE_IP: 10.30.0.11
-      IDS_ATTACKER_ID: orch1
-      IDS_ORCH_PLC1: 10.30.0.3:5020
-      IDS_ORCH_PLC2: 10.30.0.5:5020
-      IDS_MODBUS_UNIT: "0"
-      IDS_MIN_GAP_SEC: "25"
-      IDS_MAX_GAP_SEC: "180"
-      IDS_ATTACK_PROB: "0.72"
-      IDS_BENIGN_EXTRA_MAX: "240"
-    restart: unless-stopped
-    networks:
-      grid_macvlan:
-        ipv4_address: 10.30.0.11
-
-  ids_orchestrator_2:
-    build:
-      context: .
-    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '227']
-    container_name: ids_dataset_orch2
-    hostname: ids-orch-2
-    volumes:
-      - ./dataset_out:/data
-    environment:
-      IDS_EVENTS_OUT: /data/ids_events_orch2.jsonl
-      IDS_SOURCE_IP: 10.30.0.12
-      IDS_ATTACKER_ID: orch2
-      IDS_ORCH_PLC1: 10.30.0.3:5020
-      IDS_ORCH_PLC2: 10.30.0.5:5020
-      IDS_MODBUS_UNIT: "0"
-      IDS_MIN_GAP_SEC: "30"
-      IDS_MAX_GAP_SEC: "190"
-      IDS_ATTACK_PROB: "0.72"
-      IDS_BENIGN_EXTRA_MAX: "240"
-    restart: unless-stopped
-    networks:
-      grid_macvlan:
-        ipv4_address: 10.30.0.12
-
-  ids_orchestrator_3:
-    build:
-      context: .
-    command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '331']
-    container_name: ids_dataset_orch3
-    hostname: ids-orch-3
-    volumes:
-      - ./dataset_out:/data
-    environment:
-      IDS_EVENTS_OUT: /data/ids_events_orch3.jsonl
-      IDS_SOURCE_IP: 10.30.0.13
-      IDS_ATTACKER_ID: orch3
-      IDS_ORCH_PLC1: 10.30.0.3:5020
-      IDS_ORCH_PLC2: 10.30.0.5:5020
-      IDS_MODBUS_UNIT: "0"
-      IDS_MIN_GAP_SEC: "35"
-      IDS_MAX_GAP_SEC: "200"
-      IDS_ATTACK_PROB: "0.72"
-      IDS_BENIGN_EXTRA_MAX: "240"
-    restart: unless-stopped
-    networks:
-      grid_macvlan:
-        ipv4_address: 10.30.0.13
+  # ids_orchestrator:
+  #   build:
+  #     context: .
+  #   command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '101']
+  #   container_name: ids_dataset_orch1
+  #   hostname: ids-orch-1
+  #   volumes:
+  #     - ./dataset_out:/data
+  #   environment:
+  #     IDS_EVENTS_OUT: /data/ids_events_orch1.jsonl
+  #     IDS_SOURCE_IP: 10.30.0.11
+  #     IDS_ATTACKER_ID: orch1
+  #     IDS_ORCH_PLC1: 10.30.0.3:5020
+  #     IDS_ORCH_PLC2: 10.30.0.5:5020
+  #     IDS_MODBUS_UNIT: "0"
+  #     IDS_MIN_GAP_SEC: "25"
+  #     IDS_MAX_GAP_SEC: "180"
+  #     IDS_ATTACK_PROB: "0.72"
+  #     IDS_BENIGN_EXTRA_MAX: "240"
+  #   restart: unless-stopped
+  #   networks:
+  #     grid_macvlan:
+  #       ipv4_address: 10.30.0.11
+  #
+  # ids_orchestrator_2:
+  #   build:
+  #     context: .
+  #   command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '227']
+  #   container_name: ids_dataset_orch2
+  #   hostname: ids-orch-2
+  #   volumes:
+  #     - ./dataset_out:/data
+  #   environment:
+  #     IDS_EVENTS_OUT: /data/ids_events_orch2.jsonl
+  #     IDS_SOURCE_IP: 10.30.0.12
+  #     IDS_ATTACKER_ID: orch2
+  #     IDS_ORCH_PLC1: 10.30.0.3:5020
+  #     IDS_ORCH_PLC2: 10.30.0.5:5020
+  #     IDS_MODBUS_UNIT: "0"
+  #     IDS_MIN_GAP_SEC: "30"
+  #     IDS_MAX_GAP_SEC: "190"
+  #     IDS_ATTACK_PROB: "0.72"
+  #     IDS_BENIGN_EXTRA_MAX: "240"
+  #   restart: unless-stopped
+  #   networks:
+  #     grid_macvlan:
+  #       ipv4_address: 10.30.0.12
+  #
+  # ids_orchestrator_3:
+  #   build:
+  #     context: .
+  #   command: ['/app/scripts/ids_dataset_orchestrator.py', '--seed', '331']
+  #   container_name: ids_dataset_orch3
+  #   hostname: ids-orch-3
+  #   volumes:
+  #     - ./dataset_out:/data
+  #   environment:
+  #     IDS_EVENTS_OUT: /data/ids_events_orch3.jsonl
+  #     IDS_SOURCE_IP: 10.30.0.13
+  #     IDS_ATTACKER_ID: orch3
+  #     IDS_ORCH_PLC1: 10.30.0.3:5020
+  #     IDS_ORCH_PLC2: 10.30.0.5:5020
+  #     IDS_MODBUS_UNIT: "0"
+  #     IDS_MIN_GAP_SEC: "35"
+  #     IDS_MAX_GAP_SEC: "200"
+  #     IDS_ATTACK_PROB: "0.72"
+  #     IDS_BENIGN_EXTRA_MAX: "240"
+  #   restart: unless-stopped
+  #   networks:
+  #     grid_macvlan:
+  #       ipv4_address: 10.30.0.13
 
 # ---------------------------------------------------------
 # Network Configuration (CRITICAL STEP)
