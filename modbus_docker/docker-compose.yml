@@ -78,6 +78,114 @@ services:
         ipv4_address: 10.30.0.22
 
   # ---------------------------------------------------------
+  # Benign “utility” clients (10.30.0.100–150): operator HMI, relay-style polls,
+  # slow EMS FC16 schedules — broader baseline than SCADA/historian alone.
+  # ---------------------------------------------------------
+  operator_hmi_plc1:
+    build:
+      context: .
+    command: ['/app/scripts/operator_hmi.py', '--target', '10.30.0.3:5020', '--unit', '0']
+    container_name: operator_hmi_plc1
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.100
+
+  operator_hmi_plc2:
+    build:
+      context: .
+    command: ['/app/scripts/operator_hmi.py', '--target', '10.30.0.5:5020', '--unit', '0']
+    container_name: operator_hmi_plc2
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.101
+
+  benign_relay_plc1:
+    build:
+      context: .
+    command:
+      [
+        '/app/scripts/benign_relay_poller.py',
+        '--target',
+        '10.30.0.3:5020',
+        '--unit',
+        '0',
+        '--min-interval',
+        '40',
+        '--max-interval',
+        '110',
+      ]
+    container_name: benign_relay_plc1
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.102
+
+  benign_relay_plc2:
+    build:
+      context: .
+    command:
+      [
+        '/app/scripts/benign_relay_poller.py',
+        '--target',
+        '10.30.0.5:5020',
+        '--unit',
+        '0',
+        '--min-interval',
+        '45',
+        '--max-interval',
+        '130',
+      ]
+    container_name: benign_relay_plc2
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.103
+
+  benign_ems_plc1:
+    build:
+      context: .
+    command:
+      [
+        '/app/scripts/benign_ems_scheduler.py',
+        '--target',
+        '10.30.0.3:5020',
+        '--unit',
+        '0',
+        '--min-interval',
+        '150',
+        '--max-interval',
+        '320',
+      ]
+    container_name: benign_ems_plc1
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.104
+
+  benign_ems_plc2:
+    build:
+      context: .
+    command:
+      [
+        '/app/scripts/benign_ems_scheduler.py',
+        '--target',
+        '10.30.0.5:5020',
+        '--unit',
+        '0',
+        '--min-interval',
+        '180',
+        '--max-interval',
+        '400',
+      ]
+    container_name: benign_ems_plc2
+    restart: unless-stopped
+    networks:
+      grid_macvlan:
+        ipv4_address: 10.30.0.105
+
+  # ---------------------------------------------------------
   # IDS dataset: multiple orchestrators = distinct source IPs in PCAP.
   # Same attack mix per instance; different seeds + gaps reduce lockstep sync.
   # Merge ids_events_orch*.jsonl for labels; each line includes source_ip.

@@ -166,6 +166,22 @@ def load_attack_intervals(paths: Sequence[Path]) -> List[Tuple[float, float, str
     return intervals
 
 
+def resolve_label_ts_offset(
+    ts: np.ndarray,
+    jsonl_paths: Sequence[Path],
+    manual_offset_sec: Optional[float],
+) -> tuple[float, List[Tuple[float, float, str]]]:
+    """
+    Load JSONL intervals and return ``(offset_sec, intervals)``.
+    If ``manual_offset_sec`` is ``None``, pick offset via :func:`suggest_eval_ts_offset_sec`.
+    """
+    intervals = load_attack_intervals(jsonl_paths)
+    if manual_offset_sec is not None:
+        return float(manual_offset_sec), intervals
+    off, _hits = suggest_eval_ts_offset_sec(ts, intervals)
+    return float(off), intervals
+
+
 def intervals_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
     return (a1 >= b0) and (b1 >= a0)
 
@@ -182,6 +198,8 @@ class CascadeConfig:
     packet_include_dst: bool = False
     """If set in (0, 1), fit scalers + forests only on data strictly before the time cut."""
     train_frac: Optional[float] = None
+    # If True, fit IF only on traffic outside JSONL episode intervals (see fit_and_score).
+    fit_benign_only: bool = False
     random_state: int = 42
     cascade_mode: Literal["and", "top_k"] = "top_k"
     cascade_top_k: int = 25
@@ -206,7 +224,13 @@ def _time_cut(df: pd.DataFrame, train_frac: float) -> float:
     return t_min + float(train_frac) * (t_max - t_min)
 
 
-def fit_and_score(df: pd.DataFrame, cfg: CascadeConfig) -> CascadeResult:
+def fit_and_score(
+    df: pd.DataFrame,
+    cfg: CascadeConfig,
+    *,
+    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
+    label_ts_offset_sec: float = 0.0,
+) -> CascadeResult:
     df, t0 = assign_window_index(df, cfg.window_sec)
     feat = build_window_features(df, cfg.window_sec, t0)
     win_cols = window_feature_columns(
@@ -230,6 +254,22 @@ def fit_and_score(df: pd.DataFrame, cfg: CascadeConfig) -> CascadeResult:
 
     if len(feat_fit) == 0 or len(pkt_fit) == 0:
         raise ValueError("Train split produced empty feat_fit or pkt_fit; adjust train_frac.")
+
+    if cfg.fit_benign_only:
+        if not attack_intervals:
+            raise ValueError("fit_benign_only=True requires non-empty attack_intervals")
+        off = float(label_ts_offset_sec)
+        win_hit = window_attack_overlap_labels(feat_fit, attack_intervals, offset_sec=off)
+        feat_fit = feat_fit.loc[win_hit == 0].copy()
+        idx = pkt_fit.index.to_numpy()
+        ts_sub = df.loc[idx, "ts"].values.astype(np.float64)
+        row_hit = packet_attack_labels(ts_sub, attack_intervals, offset_sec=off)
+        pkt_fit = pkt_fit.loc[row_hit == 0].copy()
+        if len(feat_fit) == 0 or len(pkt_fit) == 0:
+            raise ValueError(
+                "fit_benign_only removed all fit rows (check label_ts_offset_sec vs JSONL intervals "
+                "or disable fit_benign_only)."
+            )
 
     Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     Xp = pkt_fit[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)

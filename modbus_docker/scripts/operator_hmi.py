@@ -11,7 +11,7 @@ from pymodbus.client import ModbusTcpClient
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def run_operator(host, port, unit_id=0):
+def run_operator(host, port, unit_id: int = 0):
     client = ModbusTcpClient(host, port=port)
     logging.info(f"Starting Operator HMI against {host}:{port} (Sporadic events).")
     
@@ -51,10 +51,11 @@ def run_operator(host, port, unit_id=0):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--target', required=True, help="Server IP:PORT (e.g., 192.168.1.10:5020)")
+    parser.add_argument('--unit', type=int, default=0, help="Modbus unit / slave id")
     args = parser.parse_args()
     
     host, port = args.target.split(':')
     try:
-        run_operator(host, int(port))
+        run_operator(host, int(port), unit_id=args.unit)
     except KeyboardInterrupt:
         logging.info("Operator HMI stopped.")
