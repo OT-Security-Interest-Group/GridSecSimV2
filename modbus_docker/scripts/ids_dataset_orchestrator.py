@@ -241,6 +241,18 @@ def main() -> None:
         help="Probability of running an attack after each gap (else extended benign-only sleep)",
     )
     parser.add_argument(
+        "--benign-episode-probability",
+        type=float,
+        default=float(os.environ.get("IDS_BENIGN_EP_PROB", "0.0")),
+        help="During benign gaps, probability to run a benign Modbus episode (read/write) for more baseline variety",
+    )
+    parser.add_argument(
+        "--benign-episode-max-per-gap",
+        type=int,
+        default=int(os.environ.get("IDS_BENIGN_EP_MAX_PER_GAP", "1")),
+        help="Max benign episodes to run after each gap (when enabled)",
+    )
+    parser.add_argument(
         "--benign-extra-max",
         type=float,
         default=float(os.environ.get("IDS_BENIGN_EXTRA_MAX", "240")),
@@ -310,6 +322,16 @@ def main() -> None:
         (0.55, "dos_plc2", lambda: episode_dos(plc2_h, plc2_p, u)),
     ]
 
+    # Benign-only episodes used to enrich background traffic. Keep these lower-risk
+    # than attack episodes (no DOS, no clearly dangerous patterns).
+    weighted_benign_episodes: List[tuple[float, str, Callable[[], List[str]]]] = [
+        (1.0, "benign_read_bulk_plc1", lambda: episode_read_bulk(plc1_h, plc1_p, u)),
+        (1.0, "benign_read_bulk_plc2", lambda: episode_read_bulk(plc2_h, plc2_p, u)),
+        (0.7, "benign_read_fc_plc2", lambda: episode_read_fc(plc2_h, plc2_p, u)),
+        # occasional benign write_bulk to reflect scheduled setpoint/flag changes
+        (0.25, "benign_write_bulk_plc2", lambda: episode_write_bulk(plc2_h, plc2_p, u)),
+    ]
+
     def pick_episode() -> tuple[str, Callable[[], List[str]]]:
         total = sum(w for w, _, _ in weighted_episodes)
         r = random.uniform(0, total)
@@ -319,6 +341,16 @@ def main() -> None:
             if r <= acc:
                 return aid, fn
         return weighted_episodes[-1][1], weighted_episodes[-1][2]
+
+    def pick_benign_episode() -> tuple[str, Callable[[], List[str]]]:
+        total = sum(w for w, _, _ in weighted_benign_episodes)
+        r = random.uniform(0, total)
+        acc = 0.0
+        for w, bid, fn in weighted_benign_episodes:
+            acc += w
+            if r <= acc:
+                return bid, fn
+        return weighted_benign_episodes[-1][1], weighted_benign_episodes[-1][2]
 
     log_event(
         events_path,
@@ -343,6 +375,49 @@ def main() -> None:
                 log_base,
             )
             time.sleep(gap)
+
+            # Optional: generate additional benign traffic during the gap.
+            # Logged as its own interval so labeling code can treat as benign.
+            if args.benign_episode_probability > 0 and args.benign_episode_max_per_gap > 0:
+                for _i in range(int(args.benign_episode_max_per_gap)):
+                    if random.random() > float(args.benign_episode_probability):
+                        continue
+                    benign_id, builder = pick_benign_episode()
+                    argv = builder()
+                    cmd = build_cmd(scripts_dir, sys.executable, argv)
+                    log_event(
+                        events_path,
+                        {
+                            "event": "benign_episode_start",
+                            "benign_id": benign_id,
+                            "argv": argv,
+                            "cmd": cmd,
+                            "phase": "benign",
+                        },
+                        log_base,
+                    )
+                    t0p = time.perf_counter()
+                    try:
+                        proc = subprocess.run(
+                            cmd,
+                            cwd=str(scripts_dir),
+                            timeout=args.episode_timeout,
+                        )
+                        code = proc.returncode
+                    except subprocess.TimeoutExpired:
+                        code = -1
+                    durp = time.perf_counter() - t0p
+                    log_event(
+                        events_path,
+                        {
+                            "event": "benign_episode_end",
+                            "benign_id": benign_id,
+                            "exit_code": code,
+                            "duration_sec": round(durp, 4),
+                            "phase": "benign",
+                        },
+                        log_base,
+                    )
 
             if random.random() > args.attack_probability:
                 extra = random.uniform(0, args.benign_extra_max)
