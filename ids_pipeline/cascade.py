@@ -300,3 +300,95 @@ def window_attack_overlap_labels(
         hit = any(intervals_overlap(a0, a1, t0, t1) for t0, t1, _ in intervals)
         labels.append(1 if hit else 0)
     return np.array(labels, dtype=np.int8)
+
+
+def interval_epoch_bounds(intervals: Sequence[Tuple[float, float, str]]) -> tuple[Optional[float], Optional[float]]:
+    if not intervals:
+        return None, None
+    return min(t[0] for t in intervals), max(t[1] for t in intervals)
+
+
+def first_orchestrator_start_epoch(paths: Sequence[Path]) -> Optional[float]:
+    """First ``orchestrator_start`` timestamp across JSONL files (epoch seconds)."""
+    for path in paths:
+        p = Path(path)
+        if not p.exists():
+            continue
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                o = json.loads(line)
+                if o.get("event") != "orchestrator_start":
+                    continue
+                ts = _iso_to_epoch(o.get("ts_iso"))
+                if ts is not None:
+                    return float(ts)
+    return None
+
+
+def _count_packets_in_intervals(ts: np.ndarray, intervals: Sequence[Tuple[float, float, str]], off: float) -> int:
+    if not intervals or len(ts) == 0:
+        return 0
+    te = ts.astype(np.float64) + float(off)
+    t_starts = np.array([x[0] for x in intervals], dtype=np.float64)
+    t_ends = np.array([x[1] for x in intervals], dtype=np.float64)
+    mask = np.zeros(len(te), dtype=bool)
+    for i in range(len(t_starts)):
+        mask |= (te >= t_starts[i]) & (te <= t_ends[i])
+    return int(mask.sum())
+
+
+def suggest_eval_ts_offset_sec(
+    ts: np.ndarray,
+    intervals: Sequence[Tuple[float, float, str]],
+    *,
+    coarse_step_sec: float = 300.0,
+    span_hours: float = 14.0,
+    refine_step_sec: float = 15.0,
+) -> tuple[float, int]:
+    """
+    Grid-search an additive offset ``d`` (applied as ``ts + d``) to maximize how many
+    packet timestamps fall inside any JSONL episode interval. Use when CSV epoch and
+    JSONL ``ts_iso`` disagree (e.g. naive local clock vs UTC).
+    """
+    if not intervals:
+        return 0.0, 0
+    ts = np.asarray(ts, dtype=np.float64)
+    half = float(span_hours) * 3600.0
+    best_off, best_hits = 0.0, -1
+    for off in np.arange(-half, half + 1e-6, coarse_step_sec):
+        h = _count_packets_in_intervals(ts, intervals, float(off))
+        if h > best_hits:
+            best_hits, best_off = h, float(off)
+    lo = best_off - coarse_step_sec
+    hi = best_off + coarse_step_sec
+    for off in np.arange(lo, hi + 1e-6, refine_step_sec):
+        h = _count_packets_in_intervals(ts, intervals, float(off))
+        if h > best_hits:
+            best_hits, best_off = h, float(off)
+    return best_off, best_hits
+
+
+def time_alignment_report(
+    ts: np.ndarray, intervals: Sequence[Tuple[float, float, str]], *, offset_sec: float = 0.0
+) -> str:
+    ts = np.asarray(ts, dtype=np.float64)
+    imn, imx = interval_epoch_bounds(intervals)
+    lines = [
+        "Time alignment (epoch seconds)",
+        f"  CSV packets: n={len(ts)} min={float(ts.min()):.3f} max={float(ts.max()):.3f}",
+    ]
+    if imn is None:
+        lines.append("  JSONL episode union: (no intervals)")
+    else:
+        lines.append(
+            f"  JSONL episode union: n_intervals={len(intervals)} min={imn:.3f} max={imx:.3f}"
+        )
+        nh = _count_packets_in_intervals(ts, intervals, float(offset_sec))
+        denom = max(1, len(ts))
+        lines.append(
+            f"  Packets inside any interval (ts + {offset_sec:g}): {nh} ({100.0 * nh / denom:.3f}%)"
+        )
+    return "\n".join(lines)

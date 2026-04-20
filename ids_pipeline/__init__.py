@@ -1,23 +1,31 @@
 from .cascade import (
     CascadeConfig,
     CascadeResult,
+    first_orchestrator_start_epoch,
     fit_and_score,
+    interval_epoch_bounds,
     intervals_overlap,
     load_attack_intervals,
     load_attack_intervals_epoch,
     load_clean_csv,
     packet_attack_labels,
+    suggest_eval_ts_offset_sec,
+    time_alignment_report,
     window_attack_overlap_labels,
 )
 
 __all__ = [
     "CascadeConfig",
     "CascadeResult",
+    "first_orchestrator_start_epoch",
     "fit_and_score",
+    "interval_epoch_bounds",
     "intervals_overlap",
     "load_attack_intervals",
     "load_attack_intervals_epoch",
     "load_clean_csv",
     "packet_attack_labels",
+    "suggest_eval_ts_offset_sec",
+    "time_alignment_report",
     "window_attack_overlap_labels",
 ]
