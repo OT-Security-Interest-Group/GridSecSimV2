@@ -212,6 +212,8 @@ class CascadeResult:
     pkt: pd.DataFrame
     t_cut: Optional[float]
     config: CascadeConfig
+    """True when ``df``/``feat``/``pkt`` come from a scoring capture, not the fit capture."""
+    separate_eval_corpus: bool = False
 
 
 def _contam_arg(c: Contamination) -> Any:
@@ -224,21 +226,78 @@ def _time_cut(df: pd.DataFrame, train_frac: float) -> float:
     return t_min + float(train_frac) * (t_max - t_min)
 
 
-def fit_and_score(
-    df: pd.DataFrame,
+def _train_isolation_forests(
     cfg: CascadeConfig,
-    *,
-    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
-    label_ts_offset_sec: float = 0.0,
-) -> CascadeResult:
-    df, t0 = assign_window_index(df, cfg.window_sec)
-    feat = build_window_features(df, cfg.window_sec, t0)
-    win_cols = window_feature_columns(
-        feat, include_dst_context=cfg.include_dst_context, drop_src_identity=cfg.drop_src_identity
+    feat_fit: pd.DataFrame,
+    pkt_fit: pd.DataFrame,
+    win_cols: List[str],
+    pkt_cols: List[str],
+) -> tuple[StandardScaler, StandardScaler, IsolationForest, IsolationForest]:
+    Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    Xp = pkt_fit[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    scaler_w = StandardScaler()
+    scaler_p = StandardScaler()
+    Xwz = scaler_w.fit_transform(Xw)
+    Xpz = scaler_p.fit_transform(Xp)
+    if_win = IsolationForest(
+        n_estimators=cfg.n_estimators_win,
+        contamination=_contam_arg(cfg.win_contamination),
+        random_state=cfg.random_state,
+        n_jobs=-1,
     )
-    pkt = build_packet_table(df, include_dst=cfg.packet_include_dst)
-    pkt_cols = packet_feature_columns(pkt, include_dst=cfg.packet_include_dst)
+    if_pkt = IsolationForest(
+        n_estimators=cfg.n_estimators_pkt,
+        contamination=_contam_arg(cfg.pkt_contamination),
+        random_state=cfg.random_state,
+        n_jobs=-1,
+    )
+    if_win.fit(Xwz)
+    if_pkt.fit(Xpz)
+    return scaler_w, scaler_p, if_win, if_pkt
 
+
+def _score_and_cascade(
+    cfg: CascadeConfig,
+    scaler_w: StandardScaler,
+    scaler_p: StandardScaler,
+    if_win: IsolationForest,
+    if_pkt: IsolationForest,
+    feat: pd.DataFrame,
+    pkt: pd.DataFrame,
+    df: pd.DataFrame,
+    win_cols: List[str],
+    pkt_cols: List[str],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    Xw_all = feat[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    Xp_all = pkt[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    feat = feat.copy()
+    pkt = pkt.copy()
+    feat["if_score"] = if_win.decision_function(scaler_w.transform(Xw_all))
+    feat["if_pred"] = if_win.predict(scaler_w.transform(Xw_all))
+    pkt["pkt_if_score"] = if_pkt.decision_function(scaler_p.transform(Xp_all))
+    pkt["pkt_if_pred"] = if_pkt.predict(scaler_p.transform(Xp_all))
+    win_map = feat.set_index("w")[["if_score", "if_pred"]]
+    pkt["win_if_score"] = pkt["w"].map(win_map["if_score"])
+    pkt["win_if_pred"] = pkt["w"].map(win_map["if_pred"]).astype(np.int8)
+    win_anom = pkt["win_if_pred"].values == -1
+    if cfg.cascade_mode == "and":
+        pkt["cascade_alert"] = win_anom & (pkt["pkt_if_pred"].values == -1)
+    else:
+        rk = pkt.groupby("w")["pkt_if_score"].rank(method="first", ascending=True)
+        pkt["pkt_rank_anom_in_w"] = rk
+        pkt["cascade_alert"] = win_anom & (rk <= float(cfg.cascade_top_k))
+    pkt["cascade_alert"] = pkt["cascade_alert"].astype(bool)
+    return feat, pkt
+
+
+def _feat_pkt_fit_subset(
+    df: pd.DataFrame,
+    feat: pd.DataFrame,
+    pkt: pd.DataFrame,
+    cfg: CascadeConfig,
+    attack_intervals: Optional[Sequence[Tuple[float, float, str]]],
+    label_ts_offset_sec: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, Optional[float]]:
     t_cut: Optional[float] = None
     if cfg.train_frac is not None:
         if not (0.0 < cfg.train_frac < 1.0):
@@ -270,53 +329,79 @@ def fit_and_score(
                 "fit_benign_only removed all fit rows (check label_ts_offset_sec vs JSONL intervals "
                 "or disable fit_benign_only)."
             )
+    return feat_fit, pkt_fit, t_cut
 
-    Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    Xp = pkt_fit[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    scaler_w = StandardScaler()
-    scaler_p = StandardScaler()
-    Xwz = scaler_w.fit_transform(Xw)
-    Xpz = scaler_p.fit_transform(Xp)
-
-    if_win = IsolationForest(
-        n_estimators=cfg.n_estimators_win,
-        contamination=_contam_arg(cfg.win_contamination),
-        random_state=cfg.random_state,
-        n_jobs=-1,
+def fit_train_score_eval(
+    df_train: pd.DataFrame,
+    df_score: pd.DataFrame,
+    cfg: CascadeConfig,
+    *,
+    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
+    label_ts_offset_sec: float = 0.0,
+) -> CascadeResult:
+    """
+    Fit scalers + Isolation Forests on **df_train**, then score **df_score** (e.g. benign train CSV
+    then mixed eval capture). ``CascadeResult`` fields refer to the **scoring** dataframe.
+    """
+    df_tr, t0_tr = assign_window_index(df_train, cfg.window_sec)
+    feat_tr = build_window_features(df_tr, cfg.window_sec, t0_tr)
+    win_cols = window_feature_columns(
+        feat_tr, include_dst_context=cfg.include_dst_context, drop_src_identity=cfg.drop_src_identity
     )
-    if_pkt = IsolationForest(
-        n_estimators=cfg.n_estimators_pkt,
-        contamination=_contam_arg(cfg.pkt_contamination),
-        random_state=cfg.random_state,
-        n_jobs=-1,
+    pkt_tr = build_packet_table(df_tr, include_dst=cfg.packet_include_dst)
+    pkt_cols = packet_feature_columns(pkt_tr, include_dst=cfg.packet_include_dst)
+
+    feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
+        df_tr, feat_tr, pkt_tr, cfg, attack_intervals, label_ts_offset_sec
     )
-    if_win.fit(Xwz)
-    if_pkt.fit(Xpz)
+    scaler_w, scaler_p, if_win, if_pkt = _train_isolation_forests(
+        cfg, feat_fit, pkt_fit, win_cols, pkt_cols
+    )
 
-    Xw_all = feat[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    Xp_all = pkt[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    feat = feat.copy()
-    pkt = pkt.copy()
-    feat["if_score"] = if_win.decision_function(scaler_w.transform(Xw_all))
-    feat["if_pred"] = if_win.predict(scaler_w.transform(Xw_all))
-    pkt["pkt_if_score"] = if_pkt.decision_function(scaler_p.transform(Xp_all))
-    pkt["pkt_if_pred"] = if_pkt.predict(scaler_p.transform(Xp_all))
+    df_ev, t0_ev = assign_window_index(df_score, cfg.window_sec)
+    feat_ev = build_window_features(df_ev, cfg.window_sec, t0_ev)
+    pkt_ev = build_packet_table(df_ev, include_dst=cfg.packet_include_dst)
+    feat_ev, pkt_ev = _score_and_cascade(
+        cfg, scaler_w, scaler_p, if_win, if_pkt, feat_ev, pkt_ev, df_ev, win_cols, pkt_cols
+    )
+    return CascadeResult(
+        df=df_ev,
+        feat=feat_ev,
+        pkt=pkt_ev,
+        t_cut=t_cut,
+        config=cfg,
+        separate_eval_corpus=True,
+    )
 
-    win_map = feat.set_index("w")[["if_score", "if_pred"]]
-    pkt["win_if_score"] = pkt["w"].map(win_map["if_score"])
-    pkt["win_if_pred"] = pkt["w"].map(win_map["if_pred"]).astype(np.int8)
 
-    win_anom = pkt["win_if_pred"].values == -1
-    if cfg.cascade_mode == "and":
-        pkt["cascade_alert"] = win_anom & (pkt["pkt_if_pred"].values == -1)
-    else:
-        rk = pkt.groupby("w")["pkt_if_score"].rank(method="first", ascending=True)
-        pkt["pkt_rank_anom_in_w"] = rk
-        pkt["cascade_alert"] = win_anom & (rk <= float(cfg.cascade_top_k))
+def fit_and_score(
+    df: pd.DataFrame,
+    cfg: CascadeConfig,
+    *,
+    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
+    label_ts_offset_sec: float = 0.0,
+) -> CascadeResult:
+    df, t0 = assign_window_index(df, cfg.window_sec)
+    feat = build_window_features(df, cfg.window_sec, t0)
+    win_cols = window_feature_columns(
+        feat, include_dst_context=cfg.include_dst_context, drop_src_identity=cfg.drop_src_identity
+    )
+    pkt = build_packet_table(df, include_dst=cfg.packet_include_dst)
+    pkt_cols = packet_feature_columns(pkt, include_dst=cfg.packet_include_dst)
 
-    pkt["cascade_alert"] = pkt["cascade_alert"].astype(bool)
-    return CascadeResult(df=df, feat=feat, pkt=pkt, t_cut=t_cut, config=cfg)
+    feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
+        df, feat, pkt, cfg, attack_intervals, label_ts_offset_sec
+    )
+    scaler_w, scaler_p, if_win, if_pkt = _train_isolation_forests(
+        cfg, feat_fit, pkt_fit, win_cols, pkt_cols
+    )
+    feat, pkt = _score_and_cascade(
+        cfg, scaler_w, scaler_p, if_win, if_pkt, feat, pkt, df, win_cols, pkt_cols
+    )
+    return CascadeResult(
+        df=df, feat=feat, pkt=pkt, t_cut=t_cut, config=cfg, separate_eval_corpus=False
+    )
 
 
 def packet_attack_labels(
