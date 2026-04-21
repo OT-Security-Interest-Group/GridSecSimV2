@@ -1,4 +1,4 @@
-"""Modbus IDS: window + per-packet Isolation Forest with optional time split and cascade alerts."""
+"""Modbus IDS: windowed Isolation Forest on aggregated per-window features (unsupervised)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -15,6 +15,9 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import StandardScaler
 
 Contamination = Union[float, str]
+
+# (t_start_epoch, t_end_epoch, attack_id, orchestrator source_ip from JSONL)
+AttackInterval = Tuple[float, float, str, str]
 
 
 def shannon_entropy(counts: np.ndarray) -> float:
@@ -36,13 +39,15 @@ def load_clean_csv(path: Path | str) -> pd.DataFrame:
     df["Trans_ID"] = pd.to_numeric(df["Trans_ID"], errors="coerce")
     df["Type"] = df["Type"].astype(str)
     df["Dst IP"] = df["Dst IP"].astype(str)
-    # Epoch seconds: do not assume datetime64[ns]; pandas may infer [us]/[ms] from CSV precision.
+    if "Src IP" in df.columns:
+        df["Src IP"] = df["Src IP"].astype(str)
+    else:
+        df["Src IP"] = ""
     df["ts"] = (df["Time"] - pd.Timestamp("1970-01-01")) / pd.Timedelta("1s")
     return df
 
 
 def assign_window_index(df: pd.DataFrame, window_sec: float) -> tuple[pd.DataFrame, float]:
-    """Sort by time, set t0 and integer window id ``w``."""
     out = df.sort_values("ts").reset_index(drop=True)
     t0 = float(out["ts"].min())
     out["w"] = ((out["ts"] - t0) // float(window_sec)).astype(int)
@@ -59,6 +64,7 @@ def build_window_features(df: pd.DataFrame, window_sec: float, t0: float) -> pd.
         n_unique_func = int(func_counts.shape[0])
         func_entropy = shannon_entropy(func_counts.values)
         n_unique_dst = int(g["Dst IP"].nunique())
+        n_unique_src = int(g["Src IP"].nunique()) if "Src IP" in g.columns else 0
         trans_counts = g["Trans_ID"].value_counts(dropna=True)
         trans_reuse_max = int(trans_counts.max()) if len(trans_counts) else 0
         trans_entropy = shannon_entropy(trans_counts.values) if len(trans_counts) else 0.0
@@ -85,6 +91,7 @@ def build_window_features(df: pd.DataFrame, window_sec: float, t0: float) -> pd.
             "n_unique_func": n_unique_func,
             "func_entropy": func_entropy,
             "n_unique_unit": n_unique_unit,
+            "n_unique_src": n_unique_src,
             "n_unique_dst": n_unique_dst,
             "trans_reuse_max": trans_reuse_max,
             "trans_entropy": trans_entropy,
@@ -99,29 +106,20 @@ def build_window_features(df: pd.DataFrame, window_sec: float, t0: float) -> pd.
 
 
 def window_feature_columns(
-    feat: pd.DataFrame, *, include_dst_context: bool, drop_src_identity: bool
+    feat: pd.DataFrame,
+    *,
+    include_src_context: bool,
+    include_dst_context: bool,
+    drop_src_identity: bool,
 ) -> List[str]:
-    _ = drop_src_identity  # reserved for future raw-identity drops
     cols = [c for c in feat.columns if c not in ("w", "t_start", "t_end")]
-    if not include_dst_context:
-        cols = [c for c in cols if c != "n_unique_dst"]
-    return cols
-
-
-def build_packet_table(df: pd.DataFrame, *, include_dst: bool) -> pd.DataFrame:
-    pkt = df.sort_values("ts").reset_index(drop=True)
-    pkt["iat_sec"] = pkt["ts"].diff().fillna(0.0).clip(lower=0.0)
-    pkt["is_req"] = (pkt["Type"] == "Request").astype(np.int8)
-    pkt["data_len"] = pkt["Data"].astype(str).str.len()
-    if include_dst:
-        pkt["dst_code"], _ = pd.factorize(pkt["Dst IP"], sort=True)
-    return pkt
-
-
-def packet_feature_columns(pkt: pd.DataFrame, *, include_dst: bool) -> List[str]:
-    cols = ["Func", "Unit_ID", "Trans_ID", "is_req", "iat_sec", "data_len"]
-    if include_dst and "dst_code" in pkt.columns:
-        cols.append("dst_code")
+    if drop_src_identity:
+        cols = [c for c in cols if c not in ("n_unique_src", "n_unique_dst")]
+    else:
+        if not include_src_context:
+            cols = [c for c in cols if c != "n_unique_src"]
+        if not include_dst_context:
+            cols = [c for c in cols if c != "n_unique_dst"]
     return cols
 
 
@@ -129,10 +127,6 @@ def _iso_to_epoch(s: Any) -> Optional[float]:
     if not s:
         return None
     return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
-
-
-# (t_start_epoch, t_end_epoch, attack_id, orchestrator source_ip from JSONL)
-AttackInterval = Tuple[float, float, str, str]
 
 
 def load_attack_intervals_epoch(path: Path) -> List[AttackInterval]:
@@ -166,10 +160,10 @@ def load_attack_intervals_epoch(path: Path) -> List[AttackInterval]:
 
 
 def load_attack_intervals(paths: Sequence[Path]) -> List[AttackInterval]:
-    intervals: List[AttackInterval] = []
+    out: List[AttackInterval] = []
     for p in paths:
-        intervals.extend(load_attack_intervals_epoch(Path(p)))
-    return intervals
+        out.extend(load_attack_intervals_epoch(Path(p)))
+    return out
 
 
 def resolve_label_ts_offset(
@@ -177,11 +171,6 @@ def resolve_label_ts_offset(
     jsonl_paths: Sequence[Path],
     manual_offset_sec: Optional[float],
 ) -> tuple[float, List[AttackInterval]]:
-    """
-    Load JSONL intervals and return ``(offset_sec, intervals)``.
-    If ``manual_offset_sec`` is ``None``, pick offset via :func:`suggest_eval_ts_offset_sec`.
-    Each interval is ``(t0, t1, attack_id, source_ip)`` (``source_ip`` from ``episode_start``).
-    """
     intervals = load_attack_intervals(jsonl_paths)
     if manual_offset_sec is not None:
         return float(manual_offset_sec), intervals
@@ -194,64 +183,35 @@ def intervals_overlap(a0: float, a1: float, b0: float, b1: float) -> bool:
 
 
 @dataclass
-class CascadeConfig:
+class WindowIFConfig:
     window_sec: float = 10.0
+    # n_unique_src / n_unique_dst: toggles and privacy (see window_feature_columns).
+    include_src_context: bool = True
     include_dst_context: bool = True
-    drop_src_identity: bool = True
+    drop_src_identity: bool = False
     win_contamination: Contamination = "auto"
-    pkt_contamination: Contamination = 0.01
-    n_estimators_win: int = 300
-    n_estimators_pkt: int = 150
-    packet_include_dst: bool = False
-    """If set in (0, 1), fit scalers + forests only on data strictly before the time cut."""
+    n_estimators: int = 300
     train_frac: Optional[float] = None
-    # If True, fit IF only on traffic outside JSONL episode intervals (see fit_and_score).
     fit_benign_only: bool = False
     random_state: int = 42
-    cascade_mode: Literal["and", "top_k"] = "top_k"
-    cascade_top_k: int = 25
-    # ``cascade`` = window IF gates packet top_k/AND (default). ``pkt_if_only`` = packet IF only
-    # (fewest false negatives, many FPs). ``pkt_if_or_win`` = union of window or packet IF outliers.
-    alert_basis: Literal["cascade", "pkt_if_only", "pkt_if_or_win"] = "cascade"
-    # If >= 2, ``cascade_alert`` is True only after ``n`` consecutive True values in time order
-    # (``pkt`` is sorted by ``ts``), which trims isolated flickers and often improves precision.
-    min_consecutive_cascade: int = 0
-    # If set (e.g. 0.001), ``if_pred`` / ``pkt_if_pred`` use score quantiles on **fit** rows
-    # instead of sklearn ``predict`` (contamination). ~``benign_alert_quantile`` of fit benign
-    # lies at or below the threshold; eval alerts are rarer → higher precision on benign.
+    """If set in (0,1), ``if_pred`` uses this quantile of ``decision_function`` on **fit** rows."""
     benign_alert_quantile: Optional[float] = None
 
 
 @dataclass
-class CascadeResult:
+class WindowIFResult:
     df: pd.DataFrame
     feat: pd.DataFrame
-    pkt: pd.DataFrame
     t_cut: Optional[float]
-    config: CascadeConfig
-    """True when ``df``/``feat``/``pkt`` come from a scoring capture, not the fit capture."""
-    separate_eval_corpus: bool = False
+    config: WindowIFConfig
+    separate_eval_corpus: bool
     benign_thresh_win: Optional[float] = None
-    benign_thresh_pkt: Optional[float] = None
+    # IF decision_function on each **fit** window (benign training rows), for threshold sweeps.
+    train_if_scores: Optional[np.ndarray] = None
 
 
 def _contam_arg(c: Contamination) -> Any:
     return c if c == "auto" else float(c)
-
-
-def _consecutive_true_mask(a: np.ndarray, n: int) -> np.ndarray:
-    """Index ``j`` is True iff ``a[j-n+1 : j+1]`` are all truthy (``pkt`` time-ordered)."""
-    if n <= 1:
-        return np.asarray(a, dtype=bool)
-    x = np.asarray(a, dtype=np.int8).ravel()
-    m = len(x)
-    if m < n:
-        return np.zeros(m, dtype=bool)
-    c = np.concatenate((np.zeros(1, dtype=np.int32), np.cumsum(x.astype(np.int32))))
-    d = (c[n:] - c[:-n]) == n
-    out = np.zeros(m, dtype=bool)
-    out[n - 1 : n - 1 + len(d)] = d
-    return out
 
 
 def _time_cut(df: pd.DataFrame, train_frac: float) -> float:
@@ -260,126 +220,24 @@ def _time_cut(df: pd.DataFrame, train_frac: float) -> float:
     return t_min + float(train_frac) * (t_max - t_min)
 
 
-def _train_isolation_forests(
-    cfg: CascadeConfig,
-    feat_fit: pd.DataFrame,
-    pkt_fit: pd.DataFrame,
-    win_cols: List[str],
-    pkt_cols: List[str],
-) -> tuple[StandardScaler, StandardScaler, IsolationForest, IsolationForest, Optional[float], Optional[float]]:
-    Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    Xp = pkt_fit[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    scaler_w = StandardScaler()
-    scaler_p = StandardScaler()
-    Xwz = scaler_w.fit_transform(Xw)
-    Xpz = scaler_p.fit_transform(Xp)
-    if_win = IsolationForest(
-        n_estimators=cfg.n_estimators_win,
-        contamination=_contam_arg(cfg.win_contamination),
-        random_state=cfg.random_state,
-        n_jobs=-1,
-    )
-    if_pkt = IsolationForest(
-        n_estimators=cfg.n_estimators_pkt,
-        contamination=_contam_arg(cfg.pkt_contamination),
-        random_state=cfg.random_state,
-        n_jobs=-1,
-    )
-    if_win.fit(Xwz)
-    if_pkt.fit(Xpz)
-    benign_thresh_win: Optional[float] = None
-    benign_thresh_pkt: Optional[float] = None
-    if cfg.benign_alert_quantile is not None:
-        q = float(cfg.benign_alert_quantile)
-        if not (0.0 < q < 1.0):
-            raise ValueError("benign_alert_quantile must be strictly between 0 and 1")
-        benign_thresh_win = float(np.quantile(if_win.decision_function(Xwz), q))
-        benign_thresh_pkt = float(np.quantile(if_pkt.decision_function(Xpz), q))
-    return scaler_w, scaler_p, if_win, if_pkt, benign_thresh_win, benign_thresh_pkt
-
-
-def _score_and_cascade(
-    cfg: CascadeConfig,
-    scaler_w: StandardScaler,
-    scaler_p: StandardScaler,
-    if_win: IsolationForest,
-    if_pkt: IsolationForest,
-    feat: pd.DataFrame,
-    pkt: pd.DataFrame,
-    df: pd.DataFrame,
-    win_cols: List[str],
-    pkt_cols: List[str],
-    *,
-    benign_thresh_win: Optional[float] = None,
-    benign_thresh_pkt: Optional[float] = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    Xw_all = feat[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    Xp_all = pkt[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    feat = feat.copy()
-    pkt = pkt.copy()
-    Xwz_all = scaler_w.transform(Xw_all)
-    Xpz_all = scaler_p.transform(Xp_all)
-    feat["if_score"] = if_win.decision_function(Xwz_all)
-    if benign_thresh_win is not None:
-        tw = float(benign_thresh_win)
-        feat["if_pred"] = np.where(feat["if_score"].values <= tw, -1, 1).astype(np.int8)
-    else:
-        feat["if_pred"] = if_win.predict(Xwz_all)
-    pkt["pkt_if_score"] = if_pkt.decision_function(Xpz_all)
-    if benign_thresh_pkt is not None:
-        tp = float(benign_thresh_pkt)
-        pkt["pkt_if_pred"] = np.where(pkt["pkt_if_score"].values <= tp, -1, 1).astype(np.int8)
-    else:
-        pkt["pkt_if_pred"] = if_pkt.predict(Xpz_all)
-    win_map = feat.set_index("w")[["if_score", "if_pred"]]
-    pkt["win_if_score"] = pkt["w"].map(win_map["if_score"])
-    pkt["win_if_pred"] = pkt["w"].map(win_map["if_pred"]).astype(np.int8)
-    win_anom = pkt["win_if_pred"].values == -1
-    pkt_anom = pkt["pkt_if_pred"].values == -1
-    basis = cfg.alert_basis
-    if basis == "cascade":
-        if cfg.cascade_mode == "and":
-            pkt["cascade_alert"] = win_anom & pkt_anom
-        else:
-            rk = pkt.groupby("w")["pkt_if_score"].rank(method="first", ascending=True)
-            pkt["pkt_rank_anom_in_w"] = rk
-            pkt["cascade_alert"] = win_anom & (rk <= float(cfg.cascade_top_k))
-    elif basis == "pkt_if_only":
-        pkt["cascade_alert"] = pkt_anom
-    elif basis == "pkt_if_or_win":
-        pkt["cascade_alert"] = win_anom | pkt_anom
-    else:
-        raise ValueError(f"Unknown alert_basis: {basis!r}")
-    pkt["cascade_alert"] = pkt["cascade_alert"].astype(bool)
-    mc = int(cfg.min_consecutive_cascade)
-    if mc >= 2:
-        pkt["cascade_alert"] = _consecutive_true_mask(pkt["cascade_alert"].values, mc)
-    return feat, pkt
-
-
-def _feat_pkt_fit_subset(
+def _feat_fit_subset_from_df(
     df: pd.DataFrame,
     feat: pd.DataFrame,
-    pkt: pd.DataFrame,
-    cfg: CascadeConfig,
+    cfg: WindowIFConfig,
     attack_intervals: Optional[Sequence[AttackInterval]],
     label_ts_offset_sec: float,
-) -> tuple[pd.DataFrame, pd.DataFrame, Optional[float]]:
+) -> tuple[pd.DataFrame, Optional[float]]:
     t_cut: Optional[float] = None
     if cfg.train_frac is not None:
         if not (0.0 < cfg.train_frac < 1.0):
             raise ValueError("train_frac must be strictly between 0 and 1, or None")
         t_cut = _time_cut(df, cfg.train_frac)
-
-    feat_fit = feat if t_cut is None else feat[feat["t_end"] <= t_cut].copy()
-    if t_cut is None:
-        pkt_fit = pkt
+        feat_fit = feat[feat["t_end"] <= t_cut].copy()
     else:
-        row_train = df["ts"].values < t_cut
-        pkt_fit = pkt.loc[row_train].copy()
+        feat_fit = feat
 
-    if len(feat_fit) == 0 or len(pkt_fit) == 0:
-        raise ValueError("Train split produced empty feat_fit or pkt_fit; adjust train_frac.")
+    if len(feat_fit) == 0:
+        raise ValueError("Train split produced empty feat_fit; adjust train_frac.")
 
     if cfg.fit_benign_only:
         if not attack_intervals:
@@ -387,130 +245,299 @@ def _feat_pkt_fit_subset(
         off = float(label_ts_offset_sec)
         win_hit = window_attack_overlap_labels(feat_fit, attack_intervals, offset_sec=off)
         feat_fit = feat_fit.loc[win_hit == 0].copy()
-        idx = pkt_fit.index.to_numpy()
-        ts_sub = df.loc[idx, "ts"].values.astype(np.float64)
-        src_sub: Optional[np.ndarray] = None
-        dst_sub: Optional[np.ndarray] = None
-        if "Src IP" in df.columns:
-            src_sub = df.loc[idx, "Src IP"].astype(str).str.strip().to_numpy()
-        if "Dst IP" in df.columns:
-            dst_sub = df.loc[idx, "Dst IP"].astype(str).str.strip().to_numpy()
-        row_hit = packet_attack_labels(
-            ts_sub,
-            attack_intervals,
-            offset_sec=off,
-            pkt_src_ip=src_sub,
-            pkt_dst_ip=dst_sub,
-        )
-        pkt_fit = pkt_fit.loc[row_hit == 0].copy()
-        if len(feat_fit) == 0 or len(pkt_fit) == 0:
+        if len(feat_fit) == 0:
             raise ValueError(
-                "fit_benign_only removed all fit rows (check label_ts_offset_sec vs JSONL intervals "
-                "or disable fit_benign_only)."
+                "fit_benign_only removed all windows (check label_ts_offset_sec vs JSONL intervals)."
             )
-    return feat_fit, pkt_fit, t_cut
+    return feat_fit, t_cut
+
+
+def _train_window_if(
+    cfg: WindowIFConfig,
+    feat_fit: pd.DataFrame,
+    win_cols: List[str],
+) -> tuple[StandardScaler, IsolationForest, Optional[float], np.ndarray]:
+    Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    scaler_w = StandardScaler()
+    Xwz = scaler_w.fit_transform(Xw)
+    if_win = IsolationForest(
+        n_estimators=cfg.n_estimators,
+        contamination=_contam_arg(cfg.win_contamination),
+        random_state=cfg.random_state,
+        n_jobs=-1,
+    )
+    if_win.fit(Xwz)
+    train_if_scores = np.asarray(if_win.decision_function(Xwz), dtype=np.float64)
+    benign_thresh: Optional[float] = None
+    if cfg.benign_alert_quantile is not None:
+        q = float(cfg.benign_alert_quantile)
+        if not (0.0 < q < 1.0):
+            raise ValueError("benign_alert_quantile must be strictly between 0 and 1")
+        benign_thresh = float(np.quantile(train_if_scores, q))
+    return scaler_w, if_win, benign_thresh, train_if_scores
+
+
+def _score_windows(
+    feat: pd.DataFrame,
+    scaler_w: StandardScaler,
+    if_win: IsolationForest,
+    win_cols: List[str],
+    *,
+    benign_thresh_win: Optional[float] = None,
+) -> pd.DataFrame:
+    feat = feat.copy()
+    Xw_all = feat[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    Xwz_all = scaler_w.transform(Xw_all)
+    feat["if_score"] = if_win.decision_function(Xwz_all)
+    if benign_thresh_win is not None:
+        tw = float(benign_thresh_win)
+        feat["if_pred"] = np.where(feat["if_score"].values <= tw, -1, 1).astype(np.int8)
+    else:
+        feat["if_pred"] = if_win.predict(Xwz_all)
+    return feat
 
 
 def fit_train_score_eval(
     df_train: pd.DataFrame,
     df_score: pd.DataFrame,
-    cfg: CascadeConfig,
+    cfg: WindowIFConfig,
     *,
     attack_intervals: Optional[Sequence[AttackInterval]] = None,
     label_ts_offset_sec: float = 0.0,
-) -> CascadeResult:
-    """
-    Fit scalers + Isolation Forests on **df_train**, then score **df_score** (e.g. benign train CSV
-    then mixed eval capture). ``CascadeResult`` fields refer to the **scoring** dataframe.
-    """
+) -> WindowIFResult:
     df_tr, t0_tr = assign_window_index(df_train, cfg.window_sec)
     feat_tr = build_window_features(df_tr, cfg.window_sec, t0_tr)
     win_cols = window_feature_columns(
-        feat_tr, include_dst_context=cfg.include_dst_context, drop_src_identity=cfg.drop_src_identity
+        feat_tr,
+        include_src_context=cfg.include_src_context,
+        include_dst_context=cfg.include_dst_context,
+        drop_src_identity=cfg.drop_src_identity,
     )
-    pkt_tr = build_packet_table(df_tr, include_dst=cfg.packet_include_dst)
-    pkt_cols = packet_feature_columns(pkt_tr, include_dst=cfg.packet_include_dst)
-
-    feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
-        df_tr, feat_tr, pkt_tr, cfg, attack_intervals, label_ts_offset_sec
+    feat_fit, t_cut = _feat_fit_subset_from_df(
+        df_tr, feat_tr, cfg, attack_intervals, label_ts_offset_sec
     )
-    scaler_w, scaler_p, if_win, if_pkt, benign_tw, benign_tp = _train_isolation_forests(
-        cfg, feat_fit, pkt_fit, win_cols, pkt_cols
-    )
+    scaler_w, if_win, benign_tw, train_if_scores = _train_window_if(cfg, feat_fit, win_cols)
 
     df_ev, t0_ev = assign_window_index(df_score, cfg.window_sec)
     feat_ev = build_window_features(df_ev, cfg.window_sec, t0_ev)
-    pkt_ev = build_packet_table(df_ev, include_dst=cfg.packet_include_dst)
-    feat_ev, pkt_ev = _score_and_cascade(
-        cfg,
-        scaler_w,
-        scaler_p,
-        if_win,
-        if_pkt,
-        feat_ev,
-        pkt_ev,
-        df_ev,
-        win_cols,
-        pkt_cols,
-        benign_thresh_win=benign_tw,
-        benign_thresh_pkt=benign_tp,
-    )
-    return CascadeResult(
+    feat_ev = _score_windows(feat_ev, scaler_w, if_win, win_cols, benign_thresh_win=benign_tw)
+    return WindowIFResult(
         df=df_ev,
         feat=feat_ev,
-        pkt=pkt_ev,
         t_cut=t_cut,
         config=cfg,
         separate_eval_corpus=True,
         benign_thresh_win=benign_tw,
-        benign_thresh_pkt=benign_tp,
+        train_if_scores=train_if_scores,
     )
 
 
 def fit_and_score(
     df: pd.DataFrame,
-    cfg: CascadeConfig,
+    cfg: WindowIFConfig,
     *,
     attack_intervals: Optional[Sequence[AttackInterval]] = None,
     label_ts_offset_sec: float = 0.0,
-) -> CascadeResult:
+) -> WindowIFResult:
     df, t0 = assign_window_index(df, cfg.window_sec)
     feat = build_window_features(df, cfg.window_sec, t0)
     win_cols = window_feature_columns(
-        feat, include_dst_context=cfg.include_dst_context, drop_src_identity=cfg.drop_src_identity
-    )
-    pkt = build_packet_table(df, include_dst=cfg.packet_include_dst)
-    pkt_cols = packet_feature_columns(pkt, include_dst=cfg.packet_include_dst)
-
-    feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
-        df, feat, pkt, cfg, attack_intervals, label_ts_offset_sec
-    )
-    scaler_w, scaler_p, if_win, if_pkt, benign_tw, benign_tp = _train_isolation_forests(
-        cfg, feat_fit, pkt_fit, win_cols, pkt_cols
-    )
-    feat, pkt = _score_and_cascade(
-        cfg,
-        scaler_w,
-        scaler_p,
-        if_win,
-        if_pkt,
         feat,
-        pkt,
-        df,
-        win_cols,
-        pkt_cols,
-        benign_thresh_win=benign_tw,
-        benign_thresh_pkt=benign_tp,
+        include_src_context=cfg.include_src_context,
+        include_dst_context=cfg.include_dst_context,
+        drop_src_identity=cfg.drop_src_identity,
     )
-    return CascadeResult(
+    feat_fit, t_cut = _feat_fit_subset_from_df(
+        df,
+        feat,
+        cfg,
+        attack_intervals,
+        label_ts_offset_sec,
+    )
+    scaler_w, if_win, benign_tw, train_if_scores = _train_window_if(cfg, feat_fit, win_cols)
+    feat = _score_windows(feat, scaler_w, if_win, win_cols, benign_thresh_win=benign_tw)
+    return WindowIFResult(
         df=df,
         feat=feat,
-        pkt=pkt,
         t_cut=t_cut,
         config=cfg,
         separate_eval_corpus=False,
         benign_thresh_win=benign_tw,
-        benign_thresh_pkt=benign_tp,
+        train_if_scores=train_if_scores,
+    )
+
+
+def apply_benign_quantile_threshold(
+    feat: pd.DataFrame,
+    train_if_scores: np.ndarray,
+    q: float,
+) -> tuple[pd.DataFrame, float]:
+    """
+    Recompute ``if_pred`` on eval ``feat`` without refitting: anomaly iff
+    ``if_score <= quantile(train_if_scores, q)`` (train distribution only).
+    """
+    if not (0.0 < q < 1.0):
+        raise ValueError("q must be strictly between 0 and 1")
+    ts = np.asarray(train_if_scores, dtype=np.float64).ravel()
+    if ts.size == 0:
+        raise ValueError("train_if_scores is empty")
+    t = float(np.quantile(ts, q))
+    out = feat.copy()
+    out["if_pred"] = np.where(out["if_score"].values <= t, -1, 1).astype(np.int8)
+    return out, t
+
+
+def window_overlap_recall(y_overlap: np.ndarray, if_pred: np.ndarray) -> float:
+    """Recall for positive = JSONL-overlap window; detection = ``if_pred == -1``."""
+    y = np.asarray(y_overlap, dtype=np.int8).ravel()
+    p = np.asarray(if_pred, dtype=np.int8).ravel()
+    pos = y == 1
+    if not np.any(pos):
+        return 0.0
+    return float(((p == -1) & pos).sum() / float(pos.sum()))
+
+
+def min_quantile_for_window_recall(
+    feat: pd.DataFrame,
+    train_if_scores: np.ndarray,
+    y_overlap: np.ndarray,
+    *,
+    target_recall: float = 0.6,
+    q_min: float = 0.02,
+    q_max: float = 0.92,
+    n_steps: int = 91,
+) -> tuple[float, float, np.ndarray]:
+    """
+    Scan ``q`` ascending in ``[q_min, q_max]``; return the **first** ``q`` whose overlap recall
+    meets ``target_recall``. If never met, return the ``q`` with **best** recall on the grid
+    (typically near ``q_max``).
+    """
+    q_grid = np.linspace(q_min, q_max, n_steps)
+    y = np.asarray(y_overlap, dtype=np.int8).ravel()
+    scores = feat["if_score"].values.astype(np.float64)
+    ts_fit = np.asarray(train_if_scores, dtype=np.float64).ravel()
+    best_q, best_rec, best_pred = q_max, -1.0, np.ones(len(scores), dtype=np.int8)
+    for q in q_grid:
+        t = float(np.quantile(ts_fit, float(q)))
+        pred = np.where(scores <= t, -1, 1).astype(np.int8)
+        rec = window_overlap_recall(y, pred)
+        if rec > best_rec:
+            best_q, best_rec, best_pred = float(q), rec, pred.copy()
+        if rec >= float(target_recall):
+            return float(q), rec, pred
+    return best_q, best_rec, best_pred
+
+
+def window_overlap_precision(y_overlap: np.ndarray, if_pred: np.ndarray) -> float:
+    """Precision for positive class = flagged anomalous window among overlap-positive protocol."""
+    y = np.asarray(y_overlap, dtype=np.int8).ravel()
+    p = np.asarray(if_pred, dtype=np.int8).ravel()
+    pred_pos = p == -1
+    tp = int((pred_pos & (y == 1)).sum())
+    fp = int((pred_pos & (y == 0)).sum())
+    if tp + fp == 0:
+        return 0.0
+    return float(tp / (tp + fp))
+
+
+def flagged_window_fraction(if_pred: np.ndarray) -> float:
+    p = np.asarray(if_pred, dtype=np.int8).ravel()
+    return float((p == -1).sum() / max(1, len(p)))
+
+
+def smallest_quantile_recall_under_flag_cap(
+    feat: pd.DataFrame,
+    train_if_scores: np.ndarray,
+    y_overlap: np.ndarray,
+    *,
+    target_recall: float = 0.6,
+    max_flagged_fraction: float = 0.35,
+    q_min: float = 0.02,
+    q_max: float = 0.92,
+    n_steps: int = 91,
+) -> tuple[Optional[float], float, float, float, float, np.ndarray]:
+    """
+    **Smallest** ``q`` (ascending scan) with overlap recall ``>= target_recall`` and
+    ``flagged_window_fraction <= max_flagged_fraction`` (avoids “flag everything” when ``q`` is
+    loose).
+
+    Returns ``(q_met, q_applied, recall, precision, flagged_fraction, pred)``. On joint
+    feasibility, ``q_met == q_applied``. If no ``q`` satisfies **both** constraints, ``q_met`` is
+    ``None`` and ``q_applied`` is from :func:`max_recall_quantile_under_flag_cap` (best recall under
+    the flag cap only).
+    """
+    q_grid = np.linspace(q_min, q_max, n_steps)
+    y = np.asarray(y_overlap, dtype=np.int8).ravel()
+    scores = feat["if_score"].values.astype(np.float64)
+    ts_fit = np.asarray(train_if_scores, dtype=np.float64).ravel()
+
+    for q in q_grid:
+        t = float(np.quantile(ts_fit, float(q)))
+        pred = np.where(scores <= t, -1, 1).astype(np.int8)
+        rec = window_overlap_recall(y, pred)
+        prec = window_overlap_precision(y, pred)
+        ff = flagged_window_fraction(pred)
+        if rec >= float(target_recall) and ff <= float(max_flagged_fraction):
+            fq = float(q)
+            return (fq, fq, rec, prec, ff, pred)
+
+    q_fb, rec, prec, ff, pred = max_recall_quantile_under_flag_cap(
+        feat, train_if_scores, y_overlap,
+        max_flagged_fraction=max_flagged_fraction,
+        q_min=q_min, q_max=q_max, n_steps=n_steps,
+    )
+    return (None, q_fb, rec, prec, ff, pred)
+
+
+def max_recall_quantile_under_flag_cap(
+    feat: pd.DataFrame,
+    train_if_scores: np.ndarray,
+    y_overlap: np.ndarray,
+    *,
+    max_flagged_fraction: float = 0.30,
+    q_min: float = 0.02,
+    q_max: float = 0.92,
+    n_steps: int = 91,
+) -> tuple[float, float, float, float, np.ndarray]:
+    """
+    ``q`` that **maximizes** overlap recall subject to ``flagged_window_fraction <= max_flagged_fraction``.
+    Tie-break: **smaller** ``q`` (tighter threshold, fewer spurious flags).
+    """
+    q_grid = np.linspace(q_min, q_max, n_steps)
+    y = np.asarray(y_overlap, dtype=np.int8).ravel()
+    scores = feat["if_score"].values.astype(np.float64)
+    ts_fit = np.asarray(train_if_scores, dtype=np.float64).ravel()
+    n = len(scores)
+    max_flags = int(np.ceil(max_flagged_fraction * n))
+
+    best: Optional[tuple[float, float, float, float, np.ndarray]] = None
+    for q in q_grid:
+        t = float(np.quantile(ts_fit, float(q)))
+        pred = np.where(scores <= t, -1, 1).astype(np.int8)
+        n_flag = int((pred == -1).sum())
+        if n_flag > max_flags:
+            continue
+        rec = window_overlap_recall(y, pred)
+        prec = window_overlap_precision(y, pred)
+        ff = flagged_window_fraction(pred)
+        if best is None:
+            best = (float(q), rec, prec, ff, pred.copy())
+        elif rec > best[1] + 1e-12:
+            best = (float(q), rec, prec, ff, pred.copy())
+        elif abs(rec - best[1]) <= 1e-12 and float(q) < best[0]:
+            best = (float(q), rec, prec, ff, pred.copy())
+
+    if best is not None:
+        return best
+
+    t = float(np.quantile(ts_fit, float(q_min)))
+    pred = np.where(scores <= t, -1, 1).astype(np.int8)
+    return (
+        float(q_min),
+        window_overlap_recall(y, pred),
+        window_overlap_precision(y, pred),
+        flagged_window_fraction(pred),
+        pred,
     )
 
 
@@ -522,17 +549,7 @@ def packet_attack_labels(
     pkt_src_ip: Optional[np.ndarray] = None,
     pkt_dst_ip: Optional[np.ndarray] = None,
 ) -> np.ndarray:
-    """
-    Label packets whose time (plus ``offset_sec``) falls in a JSONL episode interval.
-
-    If ``pkt_src_ip`` / ``pkt_dst_ip`` are provided and the interval has a non-empty
-    ``source_ip``, a packet is positive only when **time** overlaps **and** either address
-    equals that episode's ``source_ip`` (Modbus request **from** the orchestrator or response
-    **to** it). If ``source_ip`` is empty, time overlap alone is used for that interval.
-
-    If neither ``pkt_src_ip`` nor ``pkt_dst_ip`` is set, labels are **time-in-episode only**
-    (same as before JSONL ``source_ip`` was added).
-    """
+    """Packet-level labels (optional, e.g. for cross-checks); primary IDS output is window ``feat``."""
     te = ts.astype(np.float64) + float(offset_sec)
     inside = np.zeros(len(te), dtype=bool)
     src = None if pkt_src_ip is None else np.asarray(pkt_src_ip).astype(str)
@@ -573,7 +590,6 @@ def interval_epoch_bounds(intervals: Sequence[AttackInterval]) -> tuple[Optional
 
 
 def first_orchestrator_start_epoch(paths: Sequence[Path]) -> Optional[float]:
-    """First ``orchestrator_start`` timestamp across JSONL files (epoch seconds)."""
     for path in paths:
         p = Path(path)
         if not p.exists():
@@ -612,11 +628,6 @@ def suggest_eval_ts_offset_sec(
     span_hours: float = 14.0,
     refine_step_sec: float = 15.0,
 ) -> tuple[float, int]:
-    """
-    Grid-search an additive offset ``d`` (applied as ``ts + d``) to maximize how many
-    packet timestamps fall inside any JSONL episode interval. Use when CSV epoch and
-    JSONL ``ts_iso`` disagree (e.g. naive local clock vs UTC).
-    """
     if not intervals:
         return 0.0, 0
     ts = np.asarray(ts, dtype=np.float64)
