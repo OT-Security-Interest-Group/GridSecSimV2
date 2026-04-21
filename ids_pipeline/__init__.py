@@ -1,4 +1,5 @@
 from .cascade import (
+    AttackInterval,
     CascadeConfig,
     CascadeResult,
     first_orchestrator_start_epoch,
@@ -17,6 +18,7 @@ from .cascade import (
 )
 
 __all__ = [
+    "AttackInterval",
     "CascadeConfig",
     "CascadeResult",
     "first_orchestrator_start_epoch",

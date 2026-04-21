@@ -36,7 +36,8 @@ def load_clean_csv(path: Path | str) -> pd.DataFrame:
     df["Trans_ID"] = pd.to_numeric(df["Trans_ID"], errors="coerce")
     df["Type"] = df["Type"].astype(str)
     df["Dst IP"] = df["Dst IP"].astype(str)
-    df["ts"] = df["Time"].astype("int64") / 1e9
+    # Epoch seconds: do not assume datetime64[ns]; pandas may infer [us]/[ms] from CSV precision.
+    df["ts"] = (df["Time"] - pd.Timestamp("1970-01-01")) / pd.Timedelta("1s")
     return df
 
 
@@ -130,9 +131,13 @@ def _iso_to_epoch(s: Any) -> Optional[float]:
     return datetime.fromisoformat(str(s).replace("Z", "+00:00")).timestamp()
 
 
-def load_attack_intervals_epoch(path: Path) -> List[Tuple[float, float, str]]:
+# (t_start_epoch, t_end_epoch, attack_id, orchestrator source_ip from JSONL)
+AttackInterval = Tuple[float, float, str, str]
+
+
+def load_attack_intervals_epoch(path: Path) -> List[AttackInterval]:
     pending: defaultdict[str, deque] = defaultdict(deque)
-    out: List[Tuple[float, float, str]] = []
+    out: List[AttackInterval] = []
     if not path.exists():
         return out
     with open(path, encoding="utf-8") as f:
@@ -147,20 +152,21 @@ def load_attack_intervals_epoch(path: Path) -> List[Tuple[float, float, str]]:
                 continue
             aid = str(o.get("attack_id", ""))
             if ev == "episode_start" and aid:
-                pending[aid].append(ts)
+                sip = str(o.get("source_ip") or "")
+                pending[aid].append((ts, sip))
             elif ev == "episode_end" and aid:
                 if not pending[aid]:
                     continue
-                t0 = pending[aid].popleft()
+                t0, sip = pending[aid].popleft()
                 t1 = ts
                 if t1 < t0:
                     t0, t1 = t1, t0
-                out.append((t0, t1, aid))
+                out.append((t0, t1, aid, sip))
     return out
 
 
-def load_attack_intervals(paths: Sequence[Path]) -> List[Tuple[float, float, str]]:
-    intervals: List[Tuple[float, float, str]] = []
+def load_attack_intervals(paths: Sequence[Path]) -> List[AttackInterval]:
+    intervals: List[AttackInterval] = []
     for p in paths:
         intervals.extend(load_attack_intervals_epoch(Path(p)))
     return intervals
@@ -170,10 +176,11 @@ def resolve_label_ts_offset(
     ts: np.ndarray,
     jsonl_paths: Sequence[Path],
     manual_offset_sec: Optional[float],
-) -> tuple[float, List[Tuple[float, float, str]]]:
+) -> tuple[float, List[AttackInterval]]:
     """
     Load JSONL intervals and return ``(offset_sec, intervals)``.
     If ``manual_offset_sec`` is ``None``, pick offset via :func:`suggest_eval_ts_offset_sec`.
+    Each interval is ``(t0, t1, attack_id, source_ip)`` (``source_ip`` from ``episode_start``).
     """
     intervals = load_attack_intervals(jsonl_paths)
     if manual_offset_sec is not None:
@@ -203,6 +210,16 @@ class CascadeConfig:
     random_state: int = 42
     cascade_mode: Literal["and", "top_k"] = "top_k"
     cascade_top_k: int = 25
+    # ``cascade`` = window IF gates packet top_k/AND (default). ``pkt_if_only`` = packet IF only
+    # (fewest false negatives, many FPs). ``pkt_if_or_win`` = union of window or packet IF outliers.
+    alert_basis: Literal["cascade", "pkt_if_only", "pkt_if_or_win"] = "cascade"
+    # If >= 2, ``cascade_alert`` is True only after ``n`` consecutive True values in time order
+    # (``pkt`` is sorted by ``ts``), which trims isolated flickers and often improves precision.
+    min_consecutive_cascade: int = 0
+    # If set (e.g. 0.001), ``if_pred`` / ``pkt_if_pred`` use score quantiles on **fit** rows
+    # instead of sklearn ``predict`` (contamination). ~``benign_alert_quantile`` of fit benign
+    # lies at or below the threshold; eval alerts are rarer → higher precision on benign.
+    benign_alert_quantile: Optional[float] = None
 
 
 @dataclass
@@ -214,10 +231,27 @@ class CascadeResult:
     config: CascadeConfig
     """True when ``df``/``feat``/``pkt`` come from a scoring capture, not the fit capture."""
     separate_eval_corpus: bool = False
+    benign_thresh_win: Optional[float] = None
+    benign_thresh_pkt: Optional[float] = None
 
 
 def _contam_arg(c: Contamination) -> Any:
     return c if c == "auto" else float(c)
+
+
+def _consecutive_true_mask(a: np.ndarray, n: int) -> np.ndarray:
+    """Index ``j`` is True iff ``a[j-n+1 : j+1]`` are all truthy (``pkt`` time-ordered)."""
+    if n <= 1:
+        return np.asarray(a, dtype=bool)
+    x = np.asarray(a, dtype=np.int8).ravel()
+    m = len(x)
+    if m < n:
+        return np.zeros(m, dtype=bool)
+    c = np.concatenate((np.zeros(1, dtype=np.int32), np.cumsum(x.astype(np.int32))))
+    d = (c[n:] - c[:-n]) == n
+    out = np.zeros(m, dtype=bool)
+    out[n - 1 : n - 1 + len(d)] = d
+    return out
 
 
 def _time_cut(df: pd.DataFrame, train_frac: float) -> float:
@@ -232,7 +266,7 @@ def _train_isolation_forests(
     pkt_fit: pd.DataFrame,
     win_cols: List[str],
     pkt_cols: List[str],
-) -> tuple[StandardScaler, StandardScaler, IsolationForest, IsolationForest]:
+) -> tuple[StandardScaler, StandardScaler, IsolationForest, IsolationForest, Optional[float], Optional[float]]:
     Xw = feat_fit[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     Xp = pkt_fit[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     scaler_w = StandardScaler()
@@ -253,7 +287,15 @@ def _train_isolation_forests(
     )
     if_win.fit(Xwz)
     if_pkt.fit(Xpz)
-    return scaler_w, scaler_p, if_win, if_pkt
+    benign_thresh_win: Optional[float] = None
+    benign_thresh_pkt: Optional[float] = None
+    if cfg.benign_alert_quantile is not None:
+        q = float(cfg.benign_alert_quantile)
+        if not (0.0 < q < 1.0):
+            raise ValueError("benign_alert_quantile must be strictly between 0 and 1")
+        benign_thresh_win = float(np.quantile(if_win.decision_function(Xwz), q))
+        benign_thresh_pkt = float(np.quantile(if_pkt.decision_function(Xpz), q))
+    return scaler_w, scaler_p, if_win, if_pkt, benign_thresh_win, benign_thresh_pkt
 
 
 def _score_and_cascade(
@@ -267,26 +309,51 @@ def _score_and_cascade(
     df: pd.DataFrame,
     win_cols: List[str],
     pkt_cols: List[str],
+    *,
+    benign_thresh_win: Optional[float] = None,
+    benign_thresh_pkt: Optional[float] = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     Xw_all = feat[win_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     Xp_all = pkt[pkt_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
     feat = feat.copy()
     pkt = pkt.copy()
-    feat["if_score"] = if_win.decision_function(scaler_w.transform(Xw_all))
-    feat["if_pred"] = if_win.predict(scaler_w.transform(Xw_all))
-    pkt["pkt_if_score"] = if_pkt.decision_function(scaler_p.transform(Xp_all))
-    pkt["pkt_if_pred"] = if_pkt.predict(scaler_p.transform(Xp_all))
+    Xwz_all = scaler_w.transform(Xw_all)
+    Xpz_all = scaler_p.transform(Xp_all)
+    feat["if_score"] = if_win.decision_function(Xwz_all)
+    if benign_thresh_win is not None:
+        tw = float(benign_thresh_win)
+        feat["if_pred"] = np.where(feat["if_score"].values <= tw, -1, 1).astype(np.int8)
+    else:
+        feat["if_pred"] = if_win.predict(Xwz_all)
+    pkt["pkt_if_score"] = if_pkt.decision_function(Xpz_all)
+    if benign_thresh_pkt is not None:
+        tp = float(benign_thresh_pkt)
+        pkt["pkt_if_pred"] = np.where(pkt["pkt_if_score"].values <= tp, -1, 1).astype(np.int8)
+    else:
+        pkt["pkt_if_pred"] = if_pkt.predict(Xpz_all)
     win_map = feat.set_index("w")[["if_score", "if_pred"]]
     pkt["win_if_score"] = pkt["w"].map(win_map["if_score"])
     pkt["win_if_pred"] = pkt["w"].map(win_map["if_pred"]).astype(np.int8)
     win_anom = pkt["win_if_pred"].values == -1
-    if cfg.cascade_mode == "and":
-        pkt["cascade_alert"] = win_anom & (pkt["pkt_if_pred"].values == -1)
+    pkt_anom = pkt["pkt_if_pred"].values == -1
+    basis = cfg.alert_basis
+    if basis == "cascade":
+        if cfg.cascade_mode == "and":
+            pkt["cascade_alert"] = win_anom & pkt_anom
+        else:
+            rk = pkt.groupby("w")["pkt_if_score"].rank(method="first", ascending=True)
+            pkt["pkt_rank_anom_in_w"] = rk
+            pkt["cascade_alert"] = win_anom & (rk <= float(cfg.cascade_top_k))
+    elif basis == "pkt_if_only":
+        pkt["cascade_alert"] = pkt_anom
+    elif basis == "pkt_if_or_win":
+        pkt["cascade_alert"] = win_anom | pkt_anom
     else:
-        rk = pkt.groupby("w")["pkt_if_score"].rank(method="first", ascending=True)
-        pkt["pkt_rank_anom_in_w"] = rk
-        pkt["cascade_alert"] = win_anom & (rk <= float(cfg.cascade_top_k))
+        raise ValueError(f"Unknown alert_basis: {basis!r}")
     pkt["cascade_alert"] = pkt["cascade_alert"].astype(bool)
+    mc = int(cfg.min_consecutive_cascade)
+    if mc >= 2:
+        pkt["cascade_alert"] = _consecutive_true_mask(pkt["cascade_alert"].values, mc)
     return feat, pkt
 
 
@@ -295,7 +362,7 @@ def _feat_pkt_fit_subset(
     feat: pd.DataFrame,
     pkt: pd.DataFrame,
     cfg: CascadeConfig,
-    attack_intervals: Optional[Sequence[Tuple[float, float, str]]],
+    attack_intervals: Optional[Sequence[AttackInterval]],
     label_ts_offset_sec: float,
 ) -> tuple[pd.DataFrame, pd.DataFrame, Optional[float]]:
     t_cut: Optional[float] = None
@@ -322,7 +389,19 @@ def _feat_pkt_fit_subset(
         feat_fit = feat_fit.loc[win_hit == 0].copy()
         idx = pkt_fit.index.to_numpy()
         ts_sub = df.loc[idx, "ts"].values.astype(np.float64)
-        row_hit = packet_attack_labels(ts_sub, attack_intervals, offset_sec=off)
+        src_sub: Optional[np.ndarray] = None
+        dst_sub: Optional[np.ndarray] = None
+        if "Src IP" in df.columns:
+            src_sub = df.loc[idx, "Src IP"].astype(str).str.strip().to_numpy()
+        if "Dst IP" in df.columns:
+            dst_sub = df.loc[idx, "Dst IP"].astype(str).str.strip().to_numpy()
+        row_hit = packet_attack_labels(
+            ts_sub,
+            attack_intervals,
+            offset_sec=off,
+            pkt_src_ip=src_sub,
+            pkt_dst_ip=dst_sub,
+        )
         pkt_fit = pkt_fit.loc[row_hit == 0].copy()
         if len(feat_fit) == 0 or len(pkt_fit) == 0:
             raise ValueError(
@@ -337,7 +416,7 @@ def fit_train_score_eval(
     df_score: pd.DataFrame,
     cfg: CascadeConfig,
     *,
-    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
+    attack_intervals: Optional[Sequence[AttackInterval]] = None,
     label_ts_offset_sec: float = 0.0,
 ) -> CascadeResult:
     """
@@ -355,7 +434,7 @@ def fit_train_score_eval(
     feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
         df_tr, feat_tr, pkt_tr, cfg, attack_intervals, label_ts_offset_sec
     )
-    scaler_w, scaler_p, if_win, if_pkt = _train_isolation_forests(
+    scaler_w, scaler_p, if_win, if_pkt, benign_tw, benign_tp = _train_isolation_forests(
         cfg, feat_fit, pkt_fit, win_cols, pkt_cols
     )
 
@@ -363,7 +442,18 @@ def fit_train_score_eval(
     feat_ev = build_window_features(df_ev, cfg.window_sec, t0_ev)
     pkt_ev = build_packet_table(df_ev, include_dst=cfg.packet_include_dst)
     feat_ev, pkt_ev = _score_and_cascade(
-        cfg, scaler_w, scaler_p, if_win, if_pkt, feat_ev, pkt_ev, df_ev, win_cols, pkt_cols
+        cfg,
+        scaler_w,
+        scaler_p,
+        if_win,
+        if_pkt,
+        feat_ev,
+        pkt_ev,
+        df_ev,
+        win_cols,
+        pkt_cols,
+        benign_thresh_win=benign_tw,
+        benign_thresh_pkt=benign_tp,
     )
     return CascadeResult(
         df=df_ev,
@@ -372,6 +462,8 @@ def fit_train_score_eval(
         t_cut=t_cut,
         config=cfg,
         separate_eval_corpus=True,
+        benign_thresh_win=benign_tw,
+        benign_thresh_pkt=benign_tp,
     )
 
 
@@ -379,7 +471,7 @@ def fit_and_score(
     df: pd.DataFrame,
     cfg: CascadeConfig,
     *,
-    attack_intervals: Optional[Sequence[Tuple[float, float, str]]] = None,
+    attack_intervals: Optional[Sequence[AttackInterval]] = None,
     label_ts_offset_sec: float = 0.0,
 ) -> CascadeResult:
     df, t0 = assign_window_index(df, cfg.window_sec)
@@ -393,41 +485,88 @@ def fit_and_score(
     feat_fit, pkt_fit, t_cut = _feat_pkt_fit_subset(
         df, feat, pkt, cfg, attack_intervals, label_ts_offset_sec
     )
-    scaler_w, scaler_p, if_win, if_pkt = _train_isolation_forests(
+    scaler_w, scaler_p, if_win, if_pkt, benign_tw, benign_tp = _train_isolation_forests(
         cfg, feat_fit, pkt_fit, win_cols, pkt_cols
     )
     feat, pkt = _score_and_cascade(
-        cfg, scaler_w, scaler_p, if_win, if_pkt, feat, pkt, df, win_cols, pkt_cols
+        cfg,
+        scaler_w,
+        scaler_p,
+        if_win,
+        if_pkt,
+        feat,
+        pkt,
+        df,
+        win_cols,
+        pkt_cols,
+        benign_thresh_win=benign_tw,
+        benign_thresh_pkt=benign_tp,
     )
     return CascadeResult(
-        df=df, feat=feat, pkt=pkt, t_cut=t_cut, config=cfg, separate_eval_corpus=False
+        df=df,
+        feat=feat,
+        pkt=pkt,
+        t_cut=t_cut,
+        config=cfg,
+        separate_eval_corpus=False,
+        benign_thresh_win=benign_tw,
+        benign_thresh_pkt=benign_tp,
     )
 
 
 def packet_attack_labels(
-    ts: np.ndarray, intervals: Sequence[Tuple[float, float, str]], *, offset_sec: float = 0.0
+    ts: np.ndarray,
+    intervals: Sequence[AttackInterval],
+    *,
+    offset_sec: float = 0.0,
+    pkt_src_ip: Optional[np.ndarray] = None,
+    pkt_dst_ip: Optional[np.ndarray] = None,
 ) -> np.ndarray:
+    """
+    Label packets whose time (plus ``offset_sec``) falls in a JSONL episode interval.
+
+    If ``pkt_src_ip`` / ``pkt_dst_ip`` are provided and the interval has a non-empty
+    ``source_ip``, a packet is positive only when **time** overlaps **and** either address
+    equals that episode's ``source_ip`` (Modbus request **from** the orchestrator or response
+    **to** it). If ``source_ip`` is empty, time overlap alone is used for that interval.
+
+    If neither ``pkt_src_ip`` nor ``pkt_dst_ip`` is set, labels are **time-in-episode only**
+    (same as before JSONL ``source_ip`` was added).
+    """
     te = ts.astype(np.float64) + float(offset_sec)
     inside = np.zeros(len(te), dtype=bool)
-    for t0, t1, _ in intervals:
-        inside |= (te >= t0) & (te <= t1)
+    src = None if pkt_src_ip is None else np.asarray(pkt_src_ip).astype(str)
+    dst = None if pkt_dst_ip is None else np.asarray(pkt_dst_ip).astype(str)
+    for row in intervals:
+        t0, t1 = float(row[0]), float(row[1])
+        sip = str(row[3]).strip() if len(row) > 3 else ""
+        time_ok = (te >= t0) & (te <= t1)
+        if sip and (src is not None or dst is not None):
+            host_ok = np.zeros(len(te), dtype=bool)
+            if src is not None:
+                host_ok |= src == sip
+            if dst is not None:
+                host_ok |= dst == sip
+            inside |= time_ok & host_ok
+        else:
+            inside |= time_ok
     return inside.astype(np.int8)
 
 
 def window_attack_overlap_labels(
-    feat: pd.DataFrame, intervals: Sequence[Tuple[float, float, str]], *, offset_sec: float = 0.0
+    feat: pd.DataFrame, intervals: Sequence[AttackInterval], *, offset_sec: float = 0.0
 ) -> np.ndarray:
     labels: List[int] = []
     off = float(offset_sec)
     for _, row in feat.iterrows():
         a0 = float(row["t_start"]) + off
         a1 = float(row["t_end"]) + off
-        hit = any(intervals_overlap(a0, a1, t0, t1) for t0, t1, _ in intervals)
+        hit = any(intervals_overlap(a0, a1, float(iv[0]), float(iv[1])) for iv in intervals)
         labels.append(1 if hit else 0)
     return np.array(labels, dtype=np.int8)
 
 
-def interval_epoch_bounds(intervals: Sequence[Tuple[float, float, str]]) -> tuple[Optional[float], Optional[float]]:
+def interval_epoch_bounds(intervals: Sequence[AttackInterval]) -> tuple[Optional[float], Optional[float]]:
     if not intervals:
         return None, None
     return min(t[0] for t in intervals), max(t[1] for t in intervals)
@@ -453,12 +592,12 @@ def first_orchestrator_start_epoch(paths: Sequence[Path]) -> Optional[float]:
     return None
 
 
-def _count_packets_in_intervals(ts: np.ndarray, intervals: Sequence[Tuple[float, float, str]], off: float) -> int:
+def _count_packets_in_intervals(ts: np.ndarray, intervals: Sequence[AttackInterval], off: float) -> int:
     if not intervals or len(ts) == 0:
         return 0
     te = ts.astype(np.float64) + float(off)
-    t_starts = np.array([x[0] for x in intervals], dtype=np.float64)
-    t_ends = np.array([x[1] for x in intervals], dtype=np.float64)
+    t_starts = np.array([float(x[0]) for x in intervals], dtype=np.float64)
+    t_ends = np.array([float(x[1]) for x in intervals], dtype=np.float64)
     mask = np.zeros(len(te), dtype=bool)
     for i in range(len(t_starts)):
         mask |= (te >= t_starts[i]) & (te <= t_ends[i])
@@ -467,7 +606,7 @@ def _count_packets_in_intervals(ts: np.ndarray, intervals: Sequence[Tuple[float,
 
 def suggest_eval_ts_offset_sec(
     ts: np.ndarray,
-    intervals: Sequence[Tuple[float, float, str]],
+    intervals: Sequence[AttackInterval],
     *,
     coarse_step_sec: float = 300.0,
     span_hours: float = 14.0,
@@ -497,7 +636,7 @@ def suggest_eval_ts_offset_sec(
 
 
 def time_alignment_report(
-    ts: np.ndarray, intervals: Sequence[Tuple[float, float, str]], *, offset_sec: float = 0.0
+    ts: np.ndarray, intervals: Sequence[AttackInterval], *, offset_sec: float = 0.0
 ) -> str:
     ts = np.asarray(ts, dtype=np.float64)
     imn, imx = interval_epoch_bounds(intervals)
